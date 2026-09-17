@@ -43,6 +43,7 @@ import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { ask } from './ask.js';
+import { createThread, getThread, listThreads, requireUser } from './threads.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -74,7 +75,17 @@ app.get('/health', async (_req, res) => {
 // ---------------------------------------------------------------- built routes
 // Registered BEFORE the 501 loop below: Express uses the first route that matches.
 
-app.post('/threads/:threadId/ask', ask);
+// Express 4 does not catch errors thrown in async handlers: the request would hang forever.
+// wrap() hands them to the error handler at the bottom, which answers 502.
+const wrap =
+  (fn: (req: express.Request, res: express.Response) => Promise<void>): express.RequestHandler =>
+  (req, res, next) =>
+    fn(req, res).catch(next);
+
+app.post('/threads', requireUser, wrap(createThread));
+app.get('/threads', requireUser, wrap(listThreads));
+app.get('/threads/:threadId', requireUser, wrap(getThread));
+app.post('/threads/:threadId/ask', requireUser, wrap(ask));
 
 // ---------------------------------------------------------------- everything else: 501
 

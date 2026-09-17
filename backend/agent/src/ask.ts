@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import pino from 'pino';
 import {
@@ -8,7 +9,7 @@ import {
   SourcesEvent,
   ThreadId,
   unresolvedCitations,
-  USER_HEADER,
+  type MessageDoc,
   type RunLog,
   type SseEventName,
   type Terminated
@@ -18,6 +19,7 @@ import { costUsd } from './llm.js';
 import { research } from './loop.js';
 import { buildSources, streamAnswer } from './answer.js';
 import { saveRun } from './runlog.js';
+import { findThread, messages, titleFromFirstQuestion } from './threads.js';
 import { sseHeaders, sseSend } from './sse.js';
 
 const log = pino({ level: env.logLevel });
@@ -34,6 +36,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
   res.setHeader(REQUEST_HEADER, requestId);
 
   // Validate here too, not only in the gateway (defense in depth, DESIGN.md Q2).
+  const userId: string = res.locals.userId; // set by requireUser → 401 before we get here
   const thread = ThreadId.safeParse(req.params.threadId);
   const body = AskBody.safeParse(req.body);
   if (!thread.success) {
@@ -45,6 +48,22 @@ export async function ask(req: Request, res: Response): Promise<void> {
     return;
   }
   const { query, depth } = body.data;
+
+  // The thread must exist and be this user's. Checked before anything is streamed or spent.
+  if (!(await findThread(thread.data, userId))) {
+    res.status(404).json({ error: 'thread not found', status: 404, requestId });
+    return;
+  }
+  await (await messages()).insertOne({
+    _id: `msg_${randomUUID()}`,
+    threadId: thread.data,
+    userId,
+    role: 'user',
+    content: query,
+    sources: [],
+    createdAt: new Date()
+  });
+  await titleFromFirstQuestion(thread.data, query);
 
   // Open the stream lazily: if the very first provider call fails, we can still answer a real 502.
   let streaming = false;
@@ -61,6 +80,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
   const tokens = { in: 0, out: 0 };
   let terminated: Terminated = 'error';
   let answerId: string | undefined;
+  let assistantMessage: MessageDoc | undefined; // saved after the stream closes
 
   try {
     // 1. research: one trace event per tool call
@@ -91,21 +111,32 @@ export async function ask(req: Request, res: Response): Promise<void> {
     // 5. done
     terminated = found.terminated;
     answerId = newId('ans');
-    send(
-      'done',
-      DoneEvent.parse({
-        answerId,
-        latencyMs: Date.now() - started,
-        ttftMs,
-        model: env.llmModel,
-        tokens,
-        costUsd: costUsd(tokens),
-        searchCached: false,
-        terminated,
-        depth
-      })
-    );
+    const done = DoneEvent.parse({
+      answerId,
+      latencyMs: Date.now() - started,
+      ttftMs,
+      model: env.llmModel,
+      tokens,
+      costUsd: costUsd(tokens),
+      searchCached: false,
+      terminated,
+      depth
+    });
+    send('done', done);
     res.end();
+
+    // 6. the answer joins the thread (saved below, after the try/catch)
+    assistantMessage = {
+      _id: `msg_${randomUUID()}`,
+      threadId: thread.data,
+      userId,
+      role: 'assistant',
+      content: answer.text,
+      answerId,
+      sources,
+      done,
+      createdAt: new Date()
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.error({ err, requestId, threadId: thread.data }, 'ask failed');
@@ -117,12 +148,20 @@ export async function ask(req: Request, res: Response): Promise<void> {
     }
   }
 
-  // 6. the run log: always, whether the run finished or failed.
-  // The response is already complete, so a failure here can only be logged, and loudly.
+  // 7. persist. The response is already complete, so a failure here can only be logged, loudly.
+  // The answer message, only for a finished run, so GET /threads/:id can show it again.
+  if (assistantMessage) {
+    try {
+      await (await messages()).insertOne(assistantMessage);
+    } catch (err) {
+      log.error({ err, requestId }, 'assistant message NOT saved');
+    }
+  }
+  // The run log: always, whether the run finished or failed.
   try {
     await saveRun({
       requestId,
-      userId: req.header(USER_HEADER) || undefined,
+      userId,
       threadId: thread.data,
       answerId,
       query,
