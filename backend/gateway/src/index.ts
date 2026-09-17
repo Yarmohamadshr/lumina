@@ -20,8 +20,11 @@ import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER } from '@lumina/contract';
+import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, ThreadId, USER_HEADER } from '@lumina/contract';
 import { env } from './env.js';
+import { requireUser, validateBody, validateParam } from './checks.js';
+import { rateLimit } from './ratelimit.js';
+import { proxy } from './proxy.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -81,6 +84,31 @@ app.get('/health', async (_req, res) => {
   };
   res.status(ai.status === 'ok' ? 200 : 503).json(body);
 });
+
+// ---------------------------------------------------------------- built routes
+// Registered BEFORE the 501 loop below: Express uses the first route that matches.
+
+// Express 4 does not catch errors thrown in async handlers; wrap() hands them to the 502 handler.
+const wrap =
+  (fn: (req: express.Request, res: express.Response) => Promise<void>): express.RequestHandler =>
+  (req, res, next) =>
+    fn(req, res).catch(next);
+
+// The order of each chain matters: 401 → 400 → 429 → proxy.
+// Body before thread: an empty body on an unknown thread is a 400, not a 404 (bench probe).
+app.post('/threads', requireUser, validateBody(CreateThreadBody), wrap(proxy));
+app.get('/threads', requireUser, wrap(proxy));
+app.get('/threads/:threadId', requireUser, validateParam('threadId', ThreadId), wrap(proxy));
+app.post('/threads/:threadId/ask', requireUser, validateBody(AskBody), validateParam('threadId', ThreadId), rateLimit, wrap(proxy));
+
+// Contract routes the agent does not build yet: pass them through, so its 501 reaches the UI
+// and each agent route lights up in the browser the moment it exists. (Not uploads: multipart.)
+app.get('/stats', requireUser, wrap(proxy));
+app.get('/memory', requireUser, wrap(proxy));
+app.delete('/memory/:memoryId', requireUser, wrap(proxy));
+app.post('/spaces', requireUser, wrap(proxy));
+app.get('/spaces', requireUser, wrap(proxy));
+app.get('/spaces/:spaceId/documents', requireUser, wrap(proxy));
 
 // ---------------------------------------------------------------- everything else: 501
 

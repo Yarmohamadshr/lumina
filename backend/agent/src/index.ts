@@ -44,6 +44,8 @@ import { env } from './env.js';
 import { pingDb } from './db.js';
 import { ask } from './ask.js';
 import { createThread, getThread, listThreads, requireUser } from './threads.js';
+import { requestLog } from './requests.js';
+import { stats } from './stats.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -54,6 +56,8 @@ app.use((req, res, next) =>
     ? next()
     : express.json({ limit: '1mb' })(req, res, next)
 );
+
+app.use(requestLog); // one log line + one `requests` row per request, keyed by X-Request-Id
 
 mkdirSync(env.runsDir, { recursive: true });
 
@@ -82,6 +86,7 @@ const wrap =
   (req, res, next) =>
     fn(req, res).catch(next);
 
+app.get('/stats', requireUser, wrap(stats));
 app.post('/threads', requireUser, wrap(createThread));
 app.get('/threads', requireUser, wrap(listThreads));
 app.get('/threads/:threadId', requireUser, wrap(getThread));

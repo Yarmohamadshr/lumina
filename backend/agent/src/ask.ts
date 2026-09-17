@@ -5,7 +5,6 @@ import {
   AskBody,
   DoneEvent,
   newId,
-  REQUEST_HEADER,
   SourcesEvent,
   ThreadId,
   unresolvedCitations,
@@ -31,9 +30,7 @@ const log = pino({ level: env.logLevel });
  */
 export async function ask(req: Request, res: Response): Promise<void> {
   const started = Date.now();
-  // Reuse the gateway's request id so one grep finds this request in both services' logs.
-  const requestId = req.header(REQUEST_HEADER) || newId('req');
-  res.setHeader(REQUEST_HEADER, requestId);
+  const requestId: string = res.locals.requestId; // set by requestLog, from the gateway's header
 
   // Validate here too, not only in the gateway (defense in depth, DESIGN.md Q2).
   const userId: string = res.locals.userId; // set by requireUser → 401 before we get here
@@ -118,10 +115,12 @@ export async function ask(req: Request, res: Response): Promise<void> {
       model: env.llmModel,
       tokens,
       costUsd: costUsd(tokens),
-      searchCached: false,
+      searchCached: found.searchCached,
       terminated,
       depth
     });
+    // What /stats reads off this request's row.
+    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached };
     send('done', done);
     res.end();
 

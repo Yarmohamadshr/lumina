@@ -3,7 +3,8 @@ import type { AskTool, Depth, Terminated, TraceEvent } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
 import { toolsFor } from './tools.js';
-import { fetchPage, PageUnreadableError, webSearch } from './search.js';
+import { fetchPage, PageUnreadableError } from './search.js';
+import { cachedWebSearch } from './cache.js';
 
 /** The tools we have built so far. toolsFor(depth) decides which of them the model sees. */
 const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
@@ -43,6 +44,8 @@ export type ResearchResult = {
   terminated: Exclude<Terminated, 'error'>;
   tokens: { in: number; out: number };
   toolCalls: number;
+  /** true only when EVERY search in this run was a cache hit (the done event's searchCached). */
+  searchCached: boolean;
 };
 
 /** What we send the model per page: enough to answer from, small enough to stay cheap. */
@@ -65,8 +68,17 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   const tokens = { in: 0, out: 0 };
   let toolCalls = 0;
   let nudged = false; // the "fetch a page first" nudge is sent at most once
+  let searches = 0;
+  let cachedSearches = 0;
 
-  const result = (terminated: 'done' | 'cap'): ResearchResult => ({ messages, pages, terminated, tokens, toolCalls });
+  const result = (terminated: 'done' | 'cap'): ResearchResult => ({
+    messages,
+    pages,
+    terminated,
+    tokens,
+    toolCalls,
+    searchCached: searches > 0 && cachedSearches === searches
+  });
 
   while (true) {
     if (Date.now() - started > maxMs) return result('cap');
@@ -135,7 +147,9 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   async function runTool(name: string, input: Record<string, unknown>): Promise<{ ok: boolean; content: string }> {
     if (name === 'web_search') {
       if (typeof input.query !== 'string' || !input.query.trim()) return { ok: false, content: 'web_search needs a query string' };
-      const hits = await webSearch(input.query);
+      const { hits, cached } = await cachedWebSearch(input.query);
+      searches++;
+      if (cached) cachedSearches++;
       for (const h of hits) titles.set(h.url, h.title);
       if (!hits.length) return { ok: true, content: 'No results.' };
       return { ok: true, content: hits.map((h) => `- ${h.title}\n  ${h.url}\n  ${h.snippet.slice(0, 300)}`).join('\n') };
