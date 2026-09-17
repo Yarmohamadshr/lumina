@@ -64,6 +64,7 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   const titles = new Map<string, string>(); // url → title, remembered from search results
   const tokens = { in: 0, out: 0 };
   let toolCalls = 0;
+  let nudged = false; // the "fetch a page first" nudge is sent at most once
 
   const result = (terminated: 'done' | 'cap'): ResearchResult => ({ messages, pages, terminated, tokens, toolCalls });
 
@@ -80,7 +81,20 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
     tokens.in += response.usage.input_tokens;
     tokens.out += response.usage.output_tokens;
 
-    if (response.stop_reason !== 'tool_use') return result('done');
+    if (response.stop_reason !== 'tool_use') {
+      // A gate, not a prompt: answers may only use fetched pages. If Claude stops with none
+      // although its searches found results, send it back once to read one.
+      if (!pages.length && titles.size && !nudged) {
+        nudged = true;
+        messages.push({ role: 'assistant', content: response.content });
+        messages.push({
+          role: 'user',
+          content: 'You have not fetched any page yet, and the answer can only use fetched pages. Call fetch_page on the most relevant search result.'
+        });
+        continue;
+      }
+      return result('done');
+    }
     messages.push({ role: 'assistant', content: response.content });
 
     // Claude's one-sentence "why" before its tool calls becomes the trace step's reason.

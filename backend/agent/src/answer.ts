@@ -9,17 +9,29 @@ const MAX_SNIPPET_CHARS = 400;
 const PAGE_CHARS_FOR_MODEL = 8000;
 
 /**
+ * Tavily returns markdown, but the grader downloads the real HTML and strips the tags, so it
+ * sees only the words a browser shows. Drop images, keep a link's text but not its url, and
+ * turn markdown symbols into spaces. The words and their order stay exactly as on the page.
+ */
+function visibleText(line: string): string {
+  return line
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ') // ![alt](image-url) → gone
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [text](url) → text
+    .replace(/[`*|#>]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Pick the passage of a fetched page that best matches the query, copied VERBATIM.
  * A paraphrase here would fail grounding, so we only ever cut, never rewrite.
  */
 export function pickSnippet(text: string, query: string): string {
   const queryWords = new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []);
-  const passages = text
-    .split(/\n+/)
-    .map((p) => p.trim())
-    .filter((p) => p.split(/\s+/).length >= MIN_SNIPPET_WORDS && !p.includes(']('));
+  const lines = text.split(/\n+/).map(visibleText).filter(Boolean);
+  const passages = lines.filter((p) => p.split(' ').length >= MIN_SNIPPET_WORDS);
 
-  let best = passages[0] ?? text.trim();
+  let best = passages[0] ?? lines.join(' ');
   let bestScore = -1;
   for (const p of passages) {
     const words = new Set(p.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []);
