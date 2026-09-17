@@ -9,6 +9,12 @@ export type FetchedPage = { url: string; text: string };
 const TAVILY = 'https://api.tavily.com';
 
 /**
+ * One page could not be read (paywall, dead link). The loop may skip it and carry on.
+ * Any OTHER error means the provider itself failed, and that must end the run.
+ */
+export class PageUnreadableError extends Error {}
+
+/**
  * POST to Tavily and return the JSON. Fail loud: any non-2xx throws, so a provider error
  * can never look like "no results" (rule A1, the Live Translate bug).
  */
@@ -35,6 +41,6 @@ export async function webSearch(query: string, max = 5): Promise<SearchHit[]> {
 export async function fetchPage(url: string): Promise<FetchedPage> {
   const data = await tavily<{ results: { url: string; raw_content: string }[] }>('/extract', { urls: [url] });
   const page = data.results[0];
-  if (!page?.raw_content) throw new Error(`fetch_page could not read ${url}`);
+  if (!page?.raw_content) throw new PageUnreadableError(`fetch_page could not read ${url}`);
   return { url: page.url, text: page.raw_content };
 }
