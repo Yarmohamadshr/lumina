@@ -1,10 +1,9 @@
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { AskTool, Depth, Terminated, TraceEvent } from '@lumina/contract';
-import { env, secrets } from './env.js';
+import { env } from './env.js';
+import { llm } from './llm.js';
 import { toolsFor } from './tools.js';
 import { fetchPage, PageUnreadableError, webSearch } from './search.js';
-
-const client = new Anthropic({ apiKey: secrets.anthropic, maxRetries: 2 });
 
 /** The tools we have built so far. toolsFor(depth) decides which of them the model sees. */
 const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
@@ -71,7 +70,7 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   while (true) {
     if (Date.now() - started > maxMs) return result('cap');
 
-    const response = await client.messages.create({
+    const response = await llm.messages.create({
       model: env.llmModel,
       max_tokens: 2000,
       system: SYSTEM,

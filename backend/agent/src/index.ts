@@ -42,6 +42,7 @@ import { mkdirSync } from 'node:fs';
 import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { ask } from './ask.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -69,6 +70,11 @@ app.get('/health', async (_req, res) => {
   };
   res.status(dbStatus === 'ok' ? 200 : 503).json(body);
 });
+
+// ---------------------------------------------------------------- built routes
+// Registered BEFORE the 501 loop below: Express uses the first route that matches.
+
+app.post('/threads/:threadId/ask', ask);
 
 // ---------------------------------------------------------------- everything else: 501
 
