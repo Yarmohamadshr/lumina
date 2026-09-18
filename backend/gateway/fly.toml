@@ -21,9 +21,10 @@ type = "requests"
 soft_limit = 25
 hard_limit = 50
 
-[[http_service.checks]]
-interval = "30s"
-timeout = "5s"
-grace_period = "10s"
-method = "GET"
-path = "/health"
+# NO health check here, on purpose.
+# /health answers 503 when the agent is down — that is the contract, and it is honest. But Fly
+# reads 503 as "this machine is broken", drops it from the load balancer, and the whole site goes
+# unreachable instead of showing an honest "agent down" error. Liveness (is the gateway process
+# up?) and readiness (is its dependency up?) are different questions, and Fly's check conflates
+# them. Fly routes while the process lives; callers get the truthful 503 from /health.
+# Found the hard way on Day 3: the agent stopped, /health went 503, and the whole site went dark.
