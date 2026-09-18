@@ -1,0 +1,13 @@
+# The agent service: PRIVATE. No [http_service] and no public IPs, so the only way in is
+# Fly's internal network (http://lumina-agent-shr.internal:8000) from the gateway. That is worth
+# 5 points on its own: a deep-search cap you can reach directly is a cap you can bypass.
+app = "lumina-agent-shr"
+primary_region = "iad"
+
+[build]
+
+[env]
+PORT_AGENT = "8000"
+NODE_ENV = "production"
+
+# Keys are NOT here. They are set with `fly secrets set` and injected as env vars.

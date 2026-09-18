@@ -1,0 +1,29 @@
+# The gateway: PUBLIC. The only service the browser talks to, and it holds no provider keys.
+app = "lumina-gateway-shr"
+primary_region = "iad"
+
+[build]
+
+[env]
+PORT_GATEWAY = "8787"
+NODE_ENV = "production"
+
+[http_service]
+internal_port = 8787
+force_https = true
+auto_stop_machines = "suspend"
+auto_start_machines = true
+min_machines_running = 1
+
+# A streamed answer can take a while; do not let the proxy cut it off.
+[http_service.concurrency]
+type = "requests"
+soft_limit = 25
+hard_limit = 50
+
+[[http_service.checks]]
+interval = "30s"
+timeout = "5s"
+grace_period = "10s"
+method = "GET"
+path = "/health"

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build -w @lumina/contract && npm run build -w @lumina/web",
+  "installCommand": "npm ci",
+  "outputDirectory": "web/dist",
+  "framework": null,
+  "rewrites": [{ "source": "/((?!assets/).*)", "destination": "/index.html" }]
+}
