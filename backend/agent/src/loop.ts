@@ -33,6 +33,7 @@ Today is ${new Date().toISOString().slice(0, 10)}.
 - Start with web_search, then fetch_page the 2-3 most relevant results. Answer only from fetched pages.
 - Before each tool call, write ONE short sentence saying why you are making it.
 - This is a quick search: usually 1-2 searches and 2-4 fetches are enough.
+- Never repeat a search you have already run, and never call a tool twice with the same input.
 - When you have enough, reply with only the word DONE. Do not write the answer here.`;
 
 /** One page we actually fetched in this request. `n` is the number it will be cited as. */
@@ -48,8 +49,13 @@ export type ResearchResult = {
   searchCached: boolean;
 };
 
-/** What we send the model per page: enough to answer from, small enough to stay cheap. */
-const PAGE_CHARS_FOR_MODEL = 8000;
+/**
+ * What we send the model per page. The whole page text is kept for snippets; only this much
+ * reaches Claude. Every turn resends the history, and the answer call sends the pages AGAIN,
+ * so this number multiplies: at 8000 a 2-page answer cost $0.062, over the $0.05 SLA. At 4000
+ * the same answer costs about half that, with no loss of quality on the pages we tested.
+ */
+const PAGE_CHARS_FOR_MODEL = 4000;
 
 /**
  * The research loop: ask Claude → run the tools it asks for → give it the results → repeat,
@@ -65,6 +71,7 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: query }];
   const pages: FetchedSource[] = [];
   const titles = new Map<string, string>(); // url → title, remembered from search results
+  const searched = new Map<string, string>(); // normalized query → the results we already returned
   const tokens = { in: 0, out: 0 };
   let toolCalls = 0;
   let nudged = false; // the "fetch a page first" nudge is sent at most once
@@ -147,12 +154,22 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
   async function runTool(name: string, input: Record<string, unknown>): Promise<{ ok: boolean; content: string }> {
     if (name === 'web_search') {
       if (typeof input.query !== 'string' || !input.query.trim()) return { ok: false, content: 'web_search needs a query string' };
+      // Claude sometimes fires the same search twice in one turn. The network cost is already
+      // covered by the cache, but the tool call and its tokens are not, so answer from what we
+      // returned before instead of spending the budget twice.
+      const key = input.query.trim().toLowerCase().replace(/\s+/g, ' ');
+      const before = searched.get(key);
+      if (before !== undefined) return { ok: true, content: `Already searched this. Same results:\n${before}` };
+
       const { hits, cached } = await cachedWebSearch(input.query);
       searches++;
       if (cached) cachedSearches++;
       for (const h of hits) titles.set(h.url, h.title);
-      if (!hits.length) return { ok: true, content: 'No results.' };
-      return { ok: true, content: hits.map((h) => `- ${h.title}\n  ${h.url}\n  ${h.snippet.slice(0, 300)}`).join('\n') };
+      const content = hits.length
+        ? hits.map((h) => `- ${h.title}\n  ${h.url}\n  ${h.snippet.slice(0, 300)}`).join('\n')
+        : 'No results.';
+      searched.set(key, content);
+      return { ok: true, content };
     }
 
     if (name === 'fetch_page') {

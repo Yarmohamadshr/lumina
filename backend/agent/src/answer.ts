@@ -6,7 +6,7 @@ import type { FetchedSource } from './loop.js';
 /** The grounding check looks for ~12 consecutive tokens of the snippet in the real page. */
 const MIN_SNIPPET_WORDS = 12;
 const MAX_SNIPPET_CHARS = 400;
-const PAGE_CHARS_FOR_MODEL = 8000;
+const PAGE_CHARS_FOR_MODEL = 4000; // see the note in loop.ts: this number multiplies into the bill
 
 /**
  * Tavily returns markdown, but the grader downloads the real HTML and strips the tags, so it
@@ -51,7 +51,11 @@ export function buildSources(pages: FetchedSource[], query: string): Source[] {
 const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provided.
 - Put a citation like [1] after every factual claim, using only the source numbers given.
 - If the sources do not answer the question, say so plainly. Never use outside knowledge.
-- Be concise: start with the direct answer, then a few short paragraphs at most. No preamble.`;
+- Be concise: start with the direct answer, then a few short paragraphs at most. No preamble.
+- Write PLAIN TEXT. No markdown: no **bold**, no ## headings, no backticks, no bullet characters.
+  The UI renders the text as it arrives, so markdown symbols show up literally and look broken.
+  For a list, write one short sentence per line instead.
+- Keep the whole answer under 200 words. Answer the question asked; do not summarise the sources.`;
 
 /**
  * Step 5: stream the answer. `onText` is called for every piece of text as it arrives.
@@ -68,7 +72,7 @@ export async function streamAnswer(
 
   const stream = llm.messages.stream({
     model: env.llmModel,
-    max_tokens: 2000,
+    max_tokens: 1200,
     thinking: { type: 'disabled' }, // no tools in this call; skipping thinking gets the first token out sooner
     system: ANSWER_SYSTEM,
     messages: [{ role: 'user', content: `Sources:\n\n${context}\n\nQuestion: ${query}` }]
