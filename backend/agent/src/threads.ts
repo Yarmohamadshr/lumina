@@ -39,6 +39,25 @@ export async function findThread(threadId: string, userId: string): Promise<Thre
   return (await threads()).findOne({ _id: threadId, userId });
 }
 
+/**
+ * The last few turns of a thread, as Claude message objects, so a follow-up question makes sense
+ * on its own. Bounded on purpose (DESIGN.md Q4): the full thread stays in Mongo, but sending 40
+ * turns to Claude on every ask would blow both the token budget and the cost SLA.
+ */
+const HISTORY_TURNS = 6;
+
+export async function recentHistory(threadId: string): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
+  const rows = await (await messages())
+    .find({ threadId }, { projection: { role: 1, content: 1, createdAt: 1 } })
+    .sort({ createdAt: -1 })
+    .limit(HISTORY_TURNS)
+    .toArray();
+  return rows
+    .reverse() // newest-first from Mongo, oldest-first for Claude
+    .filter((m) => m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content }));
+}
+
 /** A new thread's title is set from its first question, so the sidebar is readable. */
 export async function titleFromFirstQuestion(threadId: string, query: string): Promise<void> {
   await (await threads()).updateOne({ _id: threadId, title: DEFAULT_TITLE }, { $set: { title: query.slice(0, 80) } });

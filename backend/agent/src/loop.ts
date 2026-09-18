@@ -5,6 +5,7 @@ import { llm } from './llm.js';
 import { toolsFor } from './tools.js';
 import { fetchPage, PageUnreadableError } from './search.js';
 import { cachedWebSearch } from './cache.js';
+import { recallMemory, saveMemory } from './memory.js';
 
 /** The tools we have built so far. toolsFor(depth) decides which of them the model sees. */
 const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
@@ -25,11 +26,38 @@ const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
       properties: { url: { type: 'string', description: 'A url from web_search results' } },
       required: ['url']
     }
+  },
+  // The description is how the model decides when to call it, so the boundary lives here.
+  save_memory: {
+    name: 'save_memory',
+    description:
+      'Remember a DURABLE fact or preference about this user for future conversations: how they want answers, ' +
+      'what they work with, who they are. Examples: "prefers code examples over prose", "builds in TypeScript", ' +
+      '"is a nurse". NEVER save what they asked today, search results, or anything true only right now — ' +
+      'that would be a log, not a memory. Only save when the user states something about themselves.',
+    input_schema: {
+      type: 'object',
+      properties: { text: { type: 'string', description: 'The fact or preference, in one short sentence' } },
+      required: ['text']
+    }
+  },
+  recall_memory: {
+    name: 'recall_memory',
+    description:
+      'Search what you already know about this user, by meaning. Call this FIRST on any question where a ' +
+      'preference or personal detail could change the answer — which is most questions.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'What to look for, e.g. the user question itself' } },
+      required: ['query']
+    }
   }
 };
 
 const SYSTEM = `You research a question on the web before it is answered.
 Today is ${new Date().toISOString().slice(0, 10)}.
+- Call recall_memory first: what you know about this user may change how the answer should look.
+- If the user states a durable preference or fact about themselves, call save_memory once.
 - Start with web_search, then fetch_page the 2-3 most relevant results. Answer only from fetched pages.
 - Before each tool call, write ONE short sentence saying why you are making it.
 - This is a quick search: usually 1-2 searches and 2-4 fetches are enough.
@@ -62,13 +90,25 @@ const PAGE_CHARS_FOR_MODEL = 4000;
  * until it says DONE or a cap is hit. Provider errors are NOT caught here: they throw out
  * of this function, and the caller ends the run with terminated:"error" (fail loud).
  */
-export async function research(query: string, depth: Depth, emit: (ev: TraceEvent) => void): Promise<ResearchResult> {
+export type ResearchContext = {
+  userId: string;
+  threadId: string;
+  /** The last few turns of this thread, so a follow-up question makes sense on its own. */
+  history: Anthropic.MessageParam[];
+};
+
+export async function research(
+  query: string,
+  depth: Depth,
+  ctx: ResearchContext,
+  emit: (ev: TraceEvent) => void
+): Promise<ResearchResult> {
   const started = Date.now();
   const maxCalls = depth === 'deep' ? env.maxToolCallsDeep : env.maxToolCalls;
   const maxMs = (depth === 'deep' ? env.maxWallClockSecDeep : env.maxWallClockSec) * 1000;
   const tools = toolsFor(depth).flatMap((name) => TOOL_DEFS[name] ?? []);
 
-  const messages: Anthropic.MessageParam[] = [{ role: 'user', content: query }];
+  const messages: Anthropic.MessageParam[] = [...ctx.history, { role: 'user', content: query }];
   const pages: FetchedSource[] = [];
   const titles = new Map<string, string>(); // url → title, remembered from search results
   const searched = new Map<string, string>(); // normalized query → the results we already returned
@@ -186,6 +226,19 @@ export async function research(query: string, depth: Depth, emit: (ev: TraceEven
         if (err instanceof PageUnreadableError) return { ok: false, content: err.message };
         throw err; // provider failure: fail loud
       }
+    }
+
+    if (name === 'save_memory') {
+      if (typeof input.text !== 'string' || input.text.trim().length < 3) return { ok: false, content: 'save_memory needs text' };
+      await saveMemory(ctx.userId, input.text, ctx.threadId);
+      return { ok: true, content: `Saved: "${input.text.trim()}"` };
+    }
+
+    if (name === 'recall_memory') {
+      if (typeof input.query !== 'string' || !input.query.trim()) return { ok: false, content: 'recall_memory needs a query' };
+      const hits = await recallMemory(ctx.userId, input.query);
+      if (!hits.length) return { ok: true, content: 'Nothing remembered about this user yet.' };
+      return { ok: true, content: hits.map((m) => `- ${m.text}`).join('\n') };
     }
 
     // toolsFor + TOOL_DEFS mean the model never sees another tool; if it names one anyway, refuse.

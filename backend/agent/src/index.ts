@@ -46,6 +46,7 @@ import { ask } from './ask.js';
 import { createThread, getThread, listThreads, requireUser } from './threads.js';
 import { requestLog } from './requests.js';
 import { stats } from './stats.js';
+import { deleteMemory, listMemory } from './memory.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -87,6 +88,8 @@ const wrap =
     fn(req, res).catch(next);
 
 app.get('/stats', requireUser, wrap(stats));
+app.get('/memory', requireUser, wrap(listMemory));
+app.delete('/memory/:memoryId', requireUser, wrap(deleteMemory));
 app.post('/threads', requireUser, wrap(createThread));
 app.get('/threads', requireUser, wrap(listThreads));
 app.get('/threads/:threadId', requireUser, wrap(getThread));

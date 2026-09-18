@@ -18,7 +18,7 @@ import { costUsd } from './llm.js';
 import { research } from './loop.js';
 import { buildSources, streamAnswer } from './answer.js';
 import { saveRun } from './runlog.js';
-import { findThread, messages, titleFromFirstQuestion } from './threads.js';
+import { findThread, messages, recentHistory, titleFromFirstQuestion } from './threads.js';
 import { sseHeaders, sseSend } from './sse.js';
 
 const log = pino({ level: env.logLevel });
@@ -51,6 +51,9 @@ export async function ask(req: Request, res: Response): Promise<void> {
     res.status(404).json({ error: 'thread not found', status: 404, requestId });
     return;
   }
+  // Read the history BEFORE storing this question, or the question would appear twice:
+  // once as history and once as the live query.
+  const history = await recentHistory(thread.data);
   await (await messages()).insertOne({
     _id: `msg_${randomUUID()}`,
     threadId: thread.data,
@@ -80,8 +83,9 @@ export async function ask(req: Request, res: Response): Promise<void> {
   let assistantMessage: MessageDoc | undefined; // saved after the stream closes
 
   try {
-    // 1. research: one trace event per tool call
-    const found = await research(query, depth, (ev) => {
+    // 1. research: one trace event per tool call.
+    // The last few turns of this thread go with it, so "and what about its pricing?" makes sense.
+    const found = await research(query, depth, { userId, threadId: thread.data, history }, (ev) => {
       toolCalls.push({ name: ev.tool, ok: ev.ok, ms: ev.ms, ...(ev.error ? { error: ev.error } : {}) });
       send('trace', ev);
     });
