@@ -11,11 +11,14 @@ import {
   type MessageDoc,
   type RunLog,
   type SseEventName,
+  type TraceEvent,
   type Terminated
 } from '@lumina/contract';
 import { env } from './env.js';
 import { costUsd } from './llm.js';
 import { research } from './loop.js';
+import { deepSearch } from './deep.js';
+import { deepRunsToday } from './runlog.js';
 import { buildSources, streamAnswer } from './answer.js';
 import { saveRun } from './runlog.js';
 import { findThread, messages, recentHistory, titleFromFirstQuestion } from './threads.js';
@@ -51,6 +54,24 @@ export async function ask(req: Request, res: Response): Promise<void> {
     res.status(404).json({ error: 'thread not found', status: 404, requestId });
     return;
   }
+  // The spend gate, BEFORE any provider call: deep costs several times more, so a user over their
+  // daily cap is refused having spent nothing. It lives here in the AGENT, which is not publicly
+  // reachable — a cap on the edge is a cap you can bypass by calling the agent directly.
+  if (depth === 'deep') {
+    const used = await deepRunsToday(userId);
+    if (used >= env.deepDailyCap) {
+      const resetsAt = new Date();
+      resetsAt.setHours(24, 0, 0, 0); // midnight: when today's count starts again
+      res.status(429).json({
+        error: `deep search daily cap reached (${env.deepDailyCap} per day)`,
+        status: 429,
+        resetsAt: resetsAt.toISOString(),
+        requestId
+      });
+      return;
+    }
+  }
+
   // Read the history BEFORE storing this question, or the question would appear twice:
   // once as history and once as the live query.
   const history = await recentHistory(thread.data);
@@ -83,12 +104,19 @@ export async function ask(req: Request, res: Response): Promise<void> {
   let assistantMessage: MessageDoc | undefined; // saved after the stream closes
 
   try {
-    // 1. research: one trace event per tool call.
-    // The last few turns of this thread go with it, so "and what about its pricing?" makes sense.
-    const found = await research(query, depth, { userId, threadId: thread.data, history }, (ev) => {
+    // 1. research. Quick: one loop, with the thread's recent turns for context.
+    // Deep: plan → isolated subagents in parallel → merge. Either way one trace event per tool
+    // call, and on a deep run every step carries the sub-question it serves.
+    const onTrace = (ev: TraceEvent) => {
       toolCalls.push({ name: ev.tool, ok: ev.ok, ms: ev.ms, ...(ev.error ? { error: ev.error } : {}) });
       send('trace', ev);
-    });
+    };
+    const ctx = { userId, threadId: thread.data, history };
+    const found =
+      depth === 'deep'
+        ? await deepSearch(query, ctx, (subQuestions) => send('plan', { subQuestions }), onTrace)
+        : await research(query, depth, ctx, onTrace);
+    const plan = 'plan' in found ? found.plan : undefined;
     tokens.in += found.tokens.in;
     tokens.out += found.tokens.out;
     tokens.cacheWrite += found.tokens.cacheWrite;
@@ -100,7 +128,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
 
     // 3. the answer, token by token
     let ttftMs = 0;
-    const answer = await streamAnswer(query, found.pages, (text) => {
+    const answer = await streamAnswer(query, found.pages, plan, (text) => {
       if (!ttftMs) ttftMs = Date.now() - started;
       send('token', { text });
     });
@@ -121,12 +149,13 @@ export async function ask(req: Request, res: Response): Promise<void> {
       model: env.llmModel,
       tokens: { in: tokens.in + tokens.cacheWrite + tokens.cacheRead, out: tokens.out },
       costUsd: costUsd(tokens),
-      searchCached: found.searchCached,
+      searchCached: 'searchCached' in found ? found.searchCached : false,
       terminated,
-      depth
+      depth,
+      ...(plan ? { subQuestions: plan.length } : {})
     });
     // What /stats reads off this request's row.
-    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached };
+    res.locals.requestExtras = { ttftMs, searchCached: 'searchCached' in found ? found.searchCached : false };
     send('done', done);
     res.end();
 

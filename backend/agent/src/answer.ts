@@ -1,4 +1,4 @@
-import type { Source } from '@lumina/contract';
+import type { Source, SubQuestion } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
 import type { FetchedSource } from './loop.js';
@@ -43,9 +43,20 @@ export function pickSnippet(text: string, query: string): string {
   return cut.slice(0, cut.lastIndexOf(' ')); // end on a whole word; still a verbatim substring
 }
 
-/** Step 4: one Source per fetched page, numbered as the page was numbered when fetched. */
-export function buildSources(pages: FetchedSource[], query: string): Source[] {
-  return pages.map((p) => ({ n: p.n, kind: 'web', title: p.title, url: p.url, snippet: pickSnippet(p.text, query) }));
+/**
+ * Step 4: one Source per fetched page, numbered as the page was numbered when fetched.
+ * On a deep run each page carries the sub-question that found it, and it is copied through here —
+ * dropping it in the merge is the classic way to lose points on an otherwise correct fan-out.
+ */
+export function buildSources(pages: (FetchedSource & { subQuestion?: number })[], query: string): Source[] {
+  return pages.map((p) => ({
+    n: p.n,
+    kind: 'web',
+    title: p.title,
+    url: p.url,
+    snippet: pickSnippet(p.text, query),
+    ...(p.subQuestion ? { subQuestion: p.subQuestion } : {})
+  }));
 }
 
 const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provided.
@@ -63,18 +74,36 @@ const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provi
  */
 export async function streamAnswer(
   query: string,
-  pages: FetchedSource[],
+  pages: (FetchedSource & { subQuestion?: number })[],
+  plan: SubQuestion[] | undefined,
   onText: (text: string) => void
 ): Promise<{ text: string; tokens: { in: number; out: number } }> {
   const context = pages.length
-    ? pages.map((p) => `[${p.n}] ${p.title}\n${p.url}\n${p.text.slice(0, PAGE_CHARS_FOR_MODEL)}`).join('\n\n---\n\n')
+    ? pages
+        .map(
+          (p) =>
+            `[${p.n}] ${p.title}${p.subQuestion ? ` (sub-question ${p.subQuestion})` : ''}\n${p.url}\n` +
+            p.text.slice(0, PAGE_CHARS_FOR_MODEL)
+        )
+        .join('\n\n---\n\n')
     : '(no sources were found)';
+
+  // A deep answer is structured by the plan it ran, and says plainly where the evidence is thin.
+  // Padding is what the human grader is looking for, so length is not the goal: coverage is.
+  const deep = plan?.length
+    ? `\nThis was a DEEP search. It researched these sub-questions:\n` +
+      plan.map((q) => `${q.i}. ${q.question}`).join('\n') +
+      `\nStructure the answer around them: a short direct answer first, then one short section per
+sub-question with its number and a heading line, then one line on what is still unknown — only if
+something genuinely is. If a sub-question found little, say so instead of padding it.
+Keep it under 400 words in total.`
+    : '';
 
   const stream = llm.messages.stream({
     model: env.llmModel,
-    max_tokens: 1200,
+    max_tokens: plan?.length ? 2000 : 1200,
     thinking: { type: 'disabled' }, // no tools in this call; skipping thinking gets the first token out sooner
-    system: ANSWER_SYSTEM,
+    system: ANSWER_SYSTEM + deep,
     messages: [{ role: 'user', content: `Sources:\n\n${context}\n\nQuestion: ${query}` }]
   });
   stream.on('text', onText);

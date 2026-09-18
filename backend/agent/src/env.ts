@@ -19,6 +19,8 @@ export const env = {
 
   llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  /** Deep search's plan is its first paint (SLA: 4 s), so it runs on a faster, cheaper model. */
+  plannerModel: process.env.LLM_PLANNER_MODEL ?? 'claude-haiku-4-5',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
@@ -29,6 +31,8 @@ export const env = {
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
   deepDailyCap: num(process.env.DEEP_DAILY_CAP, 5),
+  /** Subagents in flight at once. 1 = sequential, which is how the parallel gain is measured. */
+  deepConcurrency: num(process.env.DEEP_CONCURRENCY, 3),
 
   // The hard caps from AGENTS.md. Raising these to make a gate pass is the failure mode
   // the caps exist to catch. Two gears, two envelopes.

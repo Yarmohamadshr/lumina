@@ -114,16 +114,48 @@ export type ResearchContext = {
   history: Anthropic.MessageParam[];
 };
 
+/**
+ * Tool calls and wall clock are capped per RUN, not per subagent. A deep search fans out to
+ * several isolated subagents, and they all draw down the same budget, so the object is shared
+ * and mutated. Sequential or parallel, 24 calls and 240 s is the whole run's envelope.
+ */
+export type Budget = { callsUsed: number; maxCalls: number; deadline: number };
+
+export const newBudget = (depth: Depth): Budget => ({
+  callsUsed: 0,
+  maxCalls: depth === 'deep' ? env.maxToolCallsDeep : env.maxToolCalls,
+  deadline: Date.now() + (depth === 'deep' ? env.maxWallClockSecDeep : env.maxWallClockSec) * 1000
+});
+
+export type ResearchOptions = {
+  /** Shared across a deep run's subagents; a quick run gets its own. */
+  budget?: Budget;
+  /** Which sub-question this subagent is serving. Tags every trace step and every page it finds. */
+  subQuestion?: number;
+  /** A subagent's own ceiling, so one greedy branch cannot eat the whole run's budget. */
+  maxCallsHere?: number;
+  /** Extra instruction for a subagent: it answers ONE part of a larger question. */
+  extraSystem?: string;
+};
+
 export async function research(
   query: string,
   depth: Depth,
   ctx: ResearchContext,
-  emit: (ev: TraceEvent) => void
+  emit: (ev: TraceEvent) => void,
+  opts: ResearchOptions = {}
 ): Promise<ResearchResult> {
-  const started = Date.now();
-  const maxCalls = depth === 'deep' ? env.maxToolCallsDeep : env.maxToolCalls;
-  const maxMs = (depth === 'deep' ? env.maxWallClockSecDeep : env.maxWallClockSec) * 1000;
-  const tools = toolsFor(depth).flatMap((name) => TOOL_DEFS[name] ?? []);
+  const budget = opts.budget ?? newBudget(depth);
+  const callsAllowedHere = opts.maxCallsHere ?? Number.POSITIVE_INFINITY;
+  let callsHere = 0;
+  // A subagent never plans (plan_research belongs to the call that fans out) and never touches
+  // memory: the parent run already recalled what it needs, and six subagents each recalling the
+  // same thing burned 6 of this run's 24 tool calls for nothing.
+  const allowed = opts.subQuestion
+    ? toolsFor('quick').filter((t) => t !== 'recall_memory' && t !== 'save_memory')
+    : toolsFor(depth);
+  const tools = allowed.flatMap((name) => TOOL_DEFS[name] ?? []);
+  const system = opts.extraSystem ? `${SYSTEM}\n${opts.extraSystem}` : SYSTEM;
 
   const messages: Anthropic.MessageParam[] = [...ctx.history, { role: 'user', content: query }];
   const pages: FetchedSource[] = [];
@@ -145,14 +177,14 @@ export async function research(
   });
 
   while (true) {
-    if (Date.now() - started > maxMs) return result('cap');
+    if (Date.now() > budget.deadline) return result('cap');
 
     markCachePoint(messages);
     const response = await llm.messages.create({
       model: env.llmModel,
       max_tokens: 2000,
       // The system prompt and the tool list never change during a run, so cache them too.
-      system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
+      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       tools,
       messages
     });
@@ -192,27 +224,37 @@ export async function research(
     for (const call of response.content) {
       if (call.type !== 'tool_use') continue;
       // Every tool_use needs a tool_result, even the ones the cap stops us from running.
-      if (capped || toolCalls >= maxCalls || Date.now() - started > maxMs) {
+      if (capped || budget.callsUsed >= budget.maxCalls || callsHere >= callsAllowedHere || Date.now() > budget.deadline) {
         capped = true;
         results.push({ type: 'tool_result', tool_use_id: call.id, content: 'Not run: tool-call cap reached.', is_error: true });
         continue;
       }
+      budget.callsUsed++;
+      callsHere++;
       toolCalls++;
       const t0 = Date.now();
       const out = await runTool(call.name, call.input as Record<string, unknown>);
       emit({
-        step: toolCalls,
+        step: budget.callsUsed,
         tool: call.name as AskTool,
         input: call.input as Record<string, unknown>,
         ok: out.ok,
         ms: Date.now() - t0,
         ...(reason ? { reason } : {}),
-        ...(out.ok ? {} : { error: out.content })
+        ...(out.ok ? {} : { error: out.content }),
+        // Mandatory on a deep run: a merged trace nobody can follow back to a sub-question is a
+        // pile, not research. Enforced here, once, so no later merge can drop it.
+        ...(opts.subQuestion ? { subQuestion: opts.subQuestion } : {})
       });
       results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, ...(out.ok ? {} : { is_error: true }) });
     }
     messages.push({ role: 'user', content: results });
-    if (capped) return result('cap');
+    if (capped) {
+      // "cap" means the RUN ran out of its envelope. A subagent stopping at its own share is our
+      // scheduling, not the run hitting a wall: the run still has budget, so it is not a partial.
+      const runOutOfRoom = budget.callsUsed >= budget.maxCalls || Date.now() > budget.deadline;
+      return result(runOutOfRoom ? 'cap' : 'done');
+    }
   }
 
   /** Runs one tool. Returns ok:false for a bad input or an unreadable page; rethrows provider failures. */
