@@ -6,7 +6,7 @@ import type { FetchedSource } from './loop.js';
 /** The grounding check looks for ~12 consecutive tokens of the snippet in the real page. */
 const MIN_SNIPPET_WORDS = 12;
 const MAX_SNIPPET_CHARS = 400;
-const PAGE_CHARS_FOR_MODEL = 4000; // see the note in loop.ts: this number multiplies into the bill
+const PAGE_CHARS_FOR_MODEL = 3000; // see the note in loop.ts: this number multiplies into the bill
 
 /**
  * Tavily returns markdown, but the grader downloads the real HTML and strips the tags, so it

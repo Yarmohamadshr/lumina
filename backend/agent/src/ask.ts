@@ -77,7 +77,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
 
   // What the run log records, filled in as the run goes.
   const toolCalls: RunLog['toolCalls'] = [];
-  const tokens = { in: 0, out: 0 };
+  const tokens = { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 };
   let terminated: Terminated = 'error';
   let answerId: string | undefined;
   let assistantMessage: MessageDoc | undefined; // saved after the stream closes
@@ -91,6 +91,8 @@ export async function ask(req: Request, res: Response): Promise<void> {
     });
     tokens.in += found.tokens.in;
     tokens.out += found.tokens.out;
+    tokens.cacheWrite += found.tokens.cacheWrite;
+    tokens.cacheRead += found.tokens.cacheRead;
 
     // 2. sources, BEFORE the first token (validated against the contract)
     const sources = SourcesEvent.parse(buildSources(found.pages, query));
@@ -117,7 +119,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       latencyMs: Date.now() - started,
       ttftMs,
       model: env.llmModel,
-      tokens,
+      tokens: { in: tokens.in + tokens.cacheWrite + tokens.cacheRead, out: tokens.out },
       costUsd: costUsd(tokens),
       searchCached: found.searchCached,
       terminated,
@@ -168,7 +170,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       threadId: thread.data,
       answerId,
       query,
-      tokens: tokens.in + tokens.out,
+      tokens: tokens.in + tokens.cacheWrite + tokens.cacheRead + tokens.out,
       wallClockSec: (Date.now() - started) / 1000,
       costUsd: costUsd(tokens),
       terminated,

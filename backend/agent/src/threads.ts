@@ -45,6 +45,7 @@ export async function findThread(threadId: string, userId: string): Promise<Thre
  * turns to Claude on every ask would blow both the token budget and the cost SLA.
  */
 const HISTORY_TURNS = 6;
+const HISTORY_CHARS_PER_TURN = 400;
 
 export async function recentHistory(threadId: string): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
   const rows = await (await messages())
@@ -55,7 +56,9 @@ export async function recentHistory(threadId: string): Promise<{ role: 'user' | 
   return rows
     .reverse() // newest-first from Mongo, oldest-first for Claude
     .filter((m) => m.content.trim())
-    .map((m) => ({ role: m.role, content: m.content }));
+    // History is context ("what were we talking about?"), not source material, so a summary of
+    // each turn is enough. Full previous answers pushed one run to $0.0588, over the $0.05 SLA.
+    .map((m) => ({ role: m.role, content: m.content.slice(0, HISTORY_CHARS_PER_TURN) }));
 }
 
 /** A new thread's title is set from its first question, so the sidebar is readable. */

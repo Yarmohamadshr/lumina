@@ -60,7 +60,7 @@ Today is ${new Date().toISOString().slice(0, 10)}.
 - If the user states a durable preference or fact about themselves, call save_memory once.
 - Start with web_search, then fetch_page the 2-3 most relevant results. Answer only from fetched pages.
 - Before each tool call, write ONE short sentence saying why you are making it.
-- This is a quick search: usually 1-2 searches and 2-4 fetches are enough.
+- This is a quick search: ONE search and TWO fetches is usually enough. Stop as soon as you can answer.
 - Never repeat a search you have already run, and never call a tool twice with the same input.
 - When you have enough, reply with only the word DONE. Do not write the answer here.`;
 
@@ -71,7 +71,7 @@ export type ResearchResult = {
   messages: Anthropic.MessageParam[];
   pages: FetchedSource[];
   terminated: Exclude<Terminated, 'error'>;
-  tokens: { in: number; out: number };
+  tokens: { in: number; out: number; cacheWrite: number; cacheRead: number };
   toolCalls: number;
   /** true only when EVERY search in this run was a cache hit (the done event's searchCached). */
   searchCached: boolean;
@@ -83,7 +83,24 @@ export type ResearchResult = {
  * so this number multiplies: at 8000 a 2-page answer cost $0.062, over the $0.05 SLA. At 4000
  * the same answer costs about half that, with no loss of quality on the pages we tested.
  */
-const PAGE_CHARS_FOR_MODEL = 4000;
+const PAGE_CHARS_FOR_MODEL = 2500;
+
+/**
+ * Prompt caching: mark the end of what we have sent so far, so the NEXT call in the loop re-reads
+ * that prefix from Anthropic's cache at about 10% of the input price instead of paying full price
+ * for the same page text again. A run that fetches 2 pages over 5 calls pays for those pages five
+ * times without this. Only the newest breakpoint is kept; the API allows a small number of them.
+ */
+function markCachePoint(messages: Anthropic.MessageParam[]): void {
+  for (const m of messages) {
+    if (typeof m.content === 'string') continue;
+    for (const block of m.content) delete (block as { cache_control?: unknown }).cache_control;
+  }
+  const last = messages[messages.length - 1];
+  if (!last || typeof last.content === 'string' || !last.content.length) return;
+  const block = last.content[last.content.length - 1] as { cache_control?: { type: 'ephemeral' } };
+  block.cache_control = { type: 'ephemeral' };
+}
 
 /**
  * The research loop: ask Claude → run the tools it asks for → give it the results → repeat,
@@ -112,7 +129,7 @@ export async function research(
   const pages: FetchedSource[] = [];
   const titles = new Map<string, string>(); // url → title, remembered from search results
   const searched = new Map<string, string>(); // normalized query → the results we already returned
-  const tokens = { in: 0, out: 0 };
+  const tokens = { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 };
   let toolCalls = 0;
   let nudged = false; // the "fetch a page first" nudge is sent at most once
   let searches = 0;
@@ -130,25 +147,33 @@ export async function research(
   while (true) {
     if (Date.now() - started > maxMs) return result('cap');
 
+    markCachePoint(messages);
     const response = await llm.messages.create({
       model: env.llmModel,
       max_tokens: 2000,
-      system: SYSTEM,
+      // The system prompt and the tool list never change during a run, so cache them too.
+      system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
       tools,
       messages
     });
     tokens.in += response.usage.input_tokens;
     tokens.out += response.usage.output_tokens;
+    tokens.cacheWrite += response.usage.cache_creation_input_tokens ?? 0;
+    tokens.cacheRead += response.usage.cache_read_input_tokens ?? 0;
 
     if (response.stop_reason !== 'tool_use') {
-      // A gate, not a prompt: answers may only use fetched pages. If Claude stops with none
-      // although its searches found results, send it back once to read one.
-      if (!pages.length && titles.size && !nudged) {
+      // A gate, not a prompt: the answer may only use pages fetched in THIS request. Claude stops
+      // early in two ways — it searched but never read a page, or (with thread history in front of
+      // it) it thinks it already knows and never searches at all. Both end with zero sources and
+      // "no sources were provided", so both get one nudge back.
+      if (!pages.length && !nudged) {
         nudged = true;
         messages.push({ role: 'assistant', content: response.content });
         messages.push({
           role: 'user',
-          content: 'You have not fetched any page yet, and the answer can only use fetched pages. Call fetch_page on the most relevant search result.'
+          content: titles.size
+            ? 'You have not fetched any page yet, and the answer can only use pages fetched in this request. Call fetch_page on the most relevant search result.'
+            : 'You have not searched yet. Earlier turns in this conversation are context, not sources: the answer may only use pages fetched in THIS request. Call web_search now, then fetch_page.'
         });
         continue;
       }
