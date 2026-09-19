@@ -47,6 +47,7 @@ import { createThread, getThread, listThreads, requireUser } from './threads.js'
 import { requestLog } from './requests.js';
 import { stats } from './stats.js';
 import { deleteMemory, listMemory } from './memory.js';
+import { createSpace, listDocuments, listSpaces, receiveFile, uploadDocument } from './spaces.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -94,6 +95,10 @@ app.post('/threads', requireUser, wrap(createThread));
 app.get('/threads', requireUser, wrap(listThreads));
 app.get('/threads/:threadId', requireUser, wrap(getThread));
 app.post('/threads/:threadId/ask', requireUser, wrap(ask));
+app.post('/spaces', requireUser, wrap(createSpace));
+app.get('/spaces', requireUser, wrap(listSpaces));
+app.post('/spaces/:spaceId/documents', requireUser, receiveFile, wrap(uploadDocument));
+app.get('/spaces/:spaceId/documents', requireUser, wrap(listDocuments));
 
 // ---------------------------------------------------------------- everything else: 501
 

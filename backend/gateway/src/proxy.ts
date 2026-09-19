@@ -22,16 +22,23 @@ export async function proxy(req: Request, res: Response): Promise<void> {
   const headers: Record<string, string> = { [REQUEST_HEADER]: requestId };
   if (res.locals.userId) headers[USER_HEADER] = res.locals.userId;
   const hasBody = req.method !== 'GET' && req.method !== 'DELETE';
-  if (hasBody) headers['content-type'] = 'application/json';
+  // An upload is multipart: pass the raw bytes through untouched (the agent's multer parses
+  // them). Everything else was already parsed and validated here, so it is re-sent as JSON.
+  const incomingType = req.header('content-type') ?? '';
+  const multipart = hasBody && incomingType.startsWith('multipart/');
+  if (multipart) headers['content-type'] = incomingType;
+  else if (hasBody) headers['content-type'] = 'application/json';
 
   let upstream: globalThis.Response;
   try {
     upstream = await fetch(`${env.agentUrl}${req.originalUrl}`, {
       method: req.method,
       headers,
-      body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+      body: multipart ? (req as unknown as ReadableStream) : hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+      // Required by Node's fetch whenever the body is a stream.
+      ...(multipart ? { duplex: 'half' } : {}),
       signal: upstreamAbort.signal
-    });
+    } as RequestInit);
   } catch (err) {
     log.error({ err, requestId }, 'agent unreachable');
     res.status(502).json({ error: `agent service unreachable: ${(err as Error).message}`, status: 502, requestId });

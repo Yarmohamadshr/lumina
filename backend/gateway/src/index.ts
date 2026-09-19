@@ -20,7 +20,18 @@ import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, ThreadId, USER_HEADER } from '@lumina/contract';
+import {
+  AskBody,
+  CreateSpaceBody,
+  CreateThreadBody,
+  HealthResponse,
+  MAX_UPLOAD_BYTES,
+  REQUEST_HEADER,
+  ROUTES,
+  SpaceId,
+  ThreadId,
+  USER_HEADER
+} from '@lumina/contract';
 import { env } from './env.js';
 import { requireUser, validateBody, validateParam } from './checks.js';
 import { rateLimit } from './ratelimit.js';
@@ -102,13 +113,24 @@ app.get('/threads/:threadId', requireUser, validateParam('threadId', ThreadId), 
 app.post('/threads/:threadId/ask', requireUser, validateBody(AskBody), validateParam('threadId', ThreadId), rateLimit, wrap(proxy));
 
 // Contract routes the agent does not build yet: pass them through, so its 501 reaches the UI
-// and each agent route lights up in the browser the moment it exists. (Not uploads: multipart.)
+// and each agent route lights up in the browser the moment it exists.
 app.get('/stats', requireUser, wrap(proxy));
 app.get('/memory', requireUser, wrap(proxy));
 app.delete('/memory/:memoryId', requireUser, wrap(proxy));
-app.post('/spaces', requireUser, wrap(proxy));
+app.post('/spaces', requireUser, validateBody(CreateSpaceBody), wrap(proxy));
 app.get('/spaces', requireUser, wrap(proxy));
-app.get('/spaces/:spaceId/documents', requireUser, wrap(proxy));
+app.get('/spaces/:spaceId/documents', requireUser, validateParam('spaceId', SpaceId), wrap(proxy));
+
+// Uploads: an obviously oversized body is refused here (413) before a byte reaches the agent.
+// The exact 25 MB check is the agent's (multer); the 1 MB slack is multipart framing.
+const refuseHugeUpload: express.RequestHandler = (req, res, next) => {
+  if (Number(req.header('content-length') ?? 0) > MAX_UPLOAD_BYTES + 1024 * 1024) {
+    res.status(413).json({ error: 'file too large: the limit is 25 MB', status: 413, requestId: String(res.locals.requestId) });
+    return;
+  }
+  next();
+};
+app.post('/spaces/:spaceId/documents', requireUser, validateParam('spaceId', SpaceId), refuseHugeUpload, wrap(proxy));
 
 // ---------------------------------------------------------------- everything else: 501
 
