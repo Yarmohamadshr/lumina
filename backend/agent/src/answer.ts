@@ -156,9 +156,9 @@ export async function streamAnswer(
    * held tokens flow; false → the stream is cancelled and `aborted` comes back. A gate that rejects
    * (a provider error in the triage) cancels the stream and rethrows: fail loud.
    */
-  speculative?: { gate: Promise<boolean>; onOpen: () => void },
+  speculative?: { gate: Promise<boolean>; onOpen: () => void; onFirstText?: () => void },
   model: string = env.llmModel
-): Promise<{ text: string; tokens: { in: number; out: number }; aborted?: true }> {
+): Promise<{ text: string; tokens: { in: number; out: number }; aborted?: true; firstTextAt?: number }> {
   const context = pages.length
     ? pages
         .map(
@@ -207,7 +207,14 @@ Keep it under 400 words in total.`
     if (open) onText(t);
     else held.push(t);
   };
-  stream.on('text', (t) => emit(guard.push(t)));
+  let firstTextAt: number | undefined; // when the MODEL produced its first text (held or not)
+  stream.on('text', (t) => {
+    if (!firstTextAt) {
+      firstTextAt = Date.now();
+      speculative?.onFirstText?.();
+    }
+    emit(guard.push(t));
+  });
   // A cancelled speculative answer still cost its input: read it from message_start, so the run's
   // costUsd stays honest even when this answer is thrown away.
   let inputTokens = 0;
@@ -241,7 +248,7 @@ Keep it under 400 words in total.`
     await gated; // a short answer can finish before the gate: its tokens are released here
     if (gateError) throw gateError;
     if (aborted) return { text: '', tokens: { in: final.usage.input_tokens, out: final.usage.output_tokens }, aborted: true };
-    return { text, tokens: { in: final.usage.input_tokens, out: final.usage.output_tokens } };
+    return { text, tokens: { in: final.usage.input_tokens, out: final.usage.output_tokens }, ...(firstTextAt ? { firstTextAt } : {}) };
   } catch (err) {
     await gated;
     if (gateError) throw gateError;

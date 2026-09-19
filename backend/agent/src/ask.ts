@@ -31,6 +31,9 @@ import { indexedTitles } from './retrieve.js';
 
 const log = pino({ level: env.logLevel });
 
+/** How long past the model's first words the gate still waits for the live citation check. */
+const CHECK_GRACE_MS = 150;
+
 /**
  * POST /threads/:threadId/ask — streams  trace* → sources → token* → done.
  * Any provider failure ends the run with an `error` event (or a real 502 if nothing was sent yet).
@@ -117,6 +120,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
   const tokens = { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 };
   // Priced per model as tokens come in: a quick run is Haiku throughout, a deep run mostly Sonnet.
   let spentUsd = 0;
+  const phases: Record<string, number> = {};
   let answerModel = env.llmModel;
   let terminated: Terminated = 'error';
   let answerId: string | undefined;
@@ -161,23 +165,45 @@ export async function ask(req: Request, res: Response): Promise<void> {
       // Fast pipeline, with a SPECULATIVE answer: Claude starts writing from the search of the
       // question as asked while Haiku's triage finishes. Nothing reaches the user until the triage
       // agrees; then sources, then the held tokens. Haiku's ~0.8 s hides inside Claude's own start.
+      // Phase timings (ms since the request started) → the request log, to see where TTFT goes.
+      const at = () => Date.now() - started;
       const start = await quickStart(query, ctx, onTrace);
+      phases.pages = at();
+      void start.decision.then(() => (phases.triage = at()), () => undefined);
+      void start.check.then(() => (phases.check = at()), () => undefined);
       sources = SourcesEvent.parse(buildSources(start.pages, query));
       const first = sources;
       // The gate opens only when BOTH agree: Haiku (no rewrite needed) and the live citation check
       // (every chosen page really shows its quote). Either one saying no cancels the speculation.
+      // Production timings showed the gate opening exactly 1,000 ms after the pages — the live check's
+      // timeout (one of two sites is usually slow from Fly) — while the model's first words had been
+      // ready for ~450 ms. So the check gets until the model is ready (+150 ms): a check that finishes
+      // in time still swaps a bad page out; one still running counts as "unknown", as a timeout did.
+      let modelReady!: () => void;
+      const ready = new Promise<void>((r) => (modelReady = r));
+      const checkOrReady = Promise.race([
+        start.check,
+        ready.then(() => new Promise<null>((r) => setTimeout(() => r(null), CHECK_GRACE_MS)))
+      ]);
       let result = await streamAnswer(
         query,
         start.pages,
         undefined,
         onToken,
         start.memories,
-        { gate: Promise.all([start.decision, start.check]).then(([d, replaced]) => !d.rewrite && !replaced), onOpen: () => send('sources', first) },
+        { gate: Promise.all([start.decision, checkOrReady]).then(([d, replaced]) => !d.rewrite && !replaced), onFirstText: () => modelReady(), onOpen: () => {
+            phases.gate = at();
+            send('sources', first);
+          }
+        },
         env.quickAnswerModel
       );
       answerModel = env.quickAnswerModel;
+      if (result.firstTextAt) phases.modelFirst = result.firstTextAt - started;
+      if (result.aborted) phases.restarted = 1;
       const decision = await start.decision;
-      const replaced = await start.check;
+      // What the gate actually decided on: a check still running at the gate did not replace anything.
+      const replaced = result.aborted ? await start.check : null;
       addTokens(decision.tokens, env.plannerModel);
       addTokens(result.tokens, env.quickAnswerModel); // a cancelled answer still cost its input
       let pages = start.pages;
@@ -244,7 +270,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       ...(plan ? { subQuestions: plan.length } : {})
     });
     // What /stats reads off this request's row.
-    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached ?? false };
+    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached ?? false, ...(Object.keys(phases).length ? { phases } : {}) };
     send('done', done);
     res.end();
 
