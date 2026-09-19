@@ -21,9 +21,13 @@ export const env = {
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
   /** Deep search's plan is its first paint (SLA: 4 s), so it runs on a faster, cheaper model. */
   plannerModel: process.env.LLM_PLANNER_MODEL ?? 'claude-haiku-4-5',
+  /** Effort for the research loop's tool-picking turns (Sonnet 5: low | medium | high | xhigh | max). */
+  loopEffort: (process.env.LLM_LOOP_EFFORT ?? 'low') as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
+  /** Tavily search_depth: basic | fast | ultra-fast | advanced (advanced costs 2 credits). */
+  searchDepth: process.env.SEARCH_DEPTH ?? 'fast',
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 

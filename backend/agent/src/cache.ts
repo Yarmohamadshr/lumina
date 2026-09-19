@@ -64,10 +64,14 @@ export async function cachedWebSearch(query: string): Promise<{ hits: SearchHit[
   const hits = await webSearch(query); // a provider error throws: never cached, never hidden
   const expiresAt = new Date(Date.now() + env.searchCacheTtlSeconds * 1000);
   lruSet(key, hits, expiresAt.getTime());
-  await collection.updateOne(
-    { _id: key },
-    { $set: { provider: env.searchProvider, query: normalize(query), results: hits, expiresAt, createdAt: new Date() } },
-    { upsert: true }
-  );
+  // Not awaited: the answer does not need the cache row, and the write was ~100 ms on the TTFT path.
+  // A failed write only means a future miss, so it is logged, never swallowed silently.
+  collection
+    .updateOne(
+      { _id: key },
+      { $set: { provider: env.searchProvider, query: normalize(query), results: hits, expiresAt, createdAt: new Date() } },
+      { upsert: true }
+    )
+    .catch((err: unknown) => console.error('searchCache write failed', (err as Error).message));
   return { hits, cached: false };
 }

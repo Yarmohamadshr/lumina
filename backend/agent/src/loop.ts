@@ -119,6 +119,13 @@ export function focus(text: string, query: string, chars: number): string {
   return `${best > 0 ? '… ' : ''}${out}${out.length < text.length ? ' …' : ''}`;
 }
 
+/**
+ * Text the MODEL reads, never the snippet: drop the page's own footnote markers. A Wikipedia page
+ * says "…in 1928.[3]", the model copied "[3]" into an answer that had 2 sources, and the run failed
+ * with a dangling citation. The citation numbers must only ever be ours.
+ */
+export const forModel = (text: string): string => text.replace(/\[\d{1,3}\]/g, '');
+
 /** The same shape for a Space's passages: added to `pages` and numbered, deduped by page. */
 function addDocHits(pages: FetchedSource[], hits: DocHit[]): FetchedSource[] {
   return hits.map((h) => {
@@ -265,6 +272,12 @@ export async function research(
     const response = await llm.messages.create({
       model: env.llmModel,
       max_tokens: 2000,
+      // Loop turns only pick the next tool; the thinking happens in what the tools return. On
+      // Sonnet 5 an omitted `thinking` means adaptive thinking ON at the default (high) effort, and
+      // each of 3–4 turns paid for it: ~12 s of a 13.6 s TTFT was the loop's own calls.
+      // Quick only: deep subagents keep the default effort they were measured with (2.7–4.5x the
+      // sources of quick, inside the 90 s SLA); low effort there could cost sources, not seconds.
+      ...(depth === 'quick' ? { output_config: { effort: env.loopEffort } } : {}),
       // The system prompt and the tool list never change during a run, so cache them too.
       system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       tools,
@@ -372,7 +385,9 @@ export async function research(
         const n = pages.length + 1;
         const title = titles.get(input.url) ?? page.url;
         pages.push({ n, kind: 'web', title, url: page.url, text: page.text });
-        return { ok: true, content: `[${n}] ${title}\n${page.text.slice(0, PAGE_CHARS_FOR_MODEL)}` };
+        // The part of the page that best matches the question, not its first N characters: the
+        // top of a page is often navigation and an intro, and the fact asked about sits further down.
+        return { ok: true, content: `[${n}] ${title}\n${forModel(focus(page.text, query, PAGE_CHARS_FOR_MODEL))}` };
       } catch (err) {
         if (err instanceof PageUnreadableError) return { ok: false, content: err.message };
         throw err; // provider failure: fail loud
@@ -388,7 +403,7 @@ export async function research(
       if (before !== undefined) return { ok: true, content: `Already searched this. Same passages:\n${before}` };
       const found = addDocHits(pages, await hybridSearch(ctx.space.spaceId, ctx.userId, input.query));
       const content = found.length
-        ? found.map((p) => `[${p.n}] ${p.kind === 'doc' ? docLabel(p.title, p.locator) : p.title}\n${focus(p.text, String(input.query), DOC_CHARS_FOR_MODEL)}`).join('\n\n')
+        ? found.map((p) => `[${p.n}] ${p.kind === 'doc' ? docLabel(p.title, p.locator) : p.title}\n${forModel(focus(p.text, String(input.query), DOC_CHARS_FOR_MODEL))}`).join('\n\n')
         : 'No matching passages in this Space.';
       searched.set(key, content);
       return { ok: true, content };

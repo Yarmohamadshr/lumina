@@ -7,6 +7,9 @@ primary_region = "iad"
 [env]
 PORT_GATEWAY = "8787"
 NODE_ENV = "production"
+# Per user, on /ask only. 30 held while an answer took ~20 s; at ~5 s the bench's 4 parallel
+# requests reach ~50/min, and a 429 counts against the error-rate SLA (Day 9).
+RATE_LIMIT_PER_MINUTE = "120"
 
 [http_service]
 internal_port = 8787

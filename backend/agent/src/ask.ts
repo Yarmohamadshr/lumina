@@ -17,6 +17,7 @@ import {
 import { env } from './env.js';
 import { costUsd } from './llm.js';
 import { research, searchSpaceOnly, type ResearchContext } from './loop.js';
+import { quickSearch } from './quick.js';
 import { deepSearch } from './deep.js';
 import { deepRunsToday } from './runlog.js';
 import { buildSources, streamAnswer } from './answer.js';
@@ -131,14 +132,18 @@ export async function ask(req: Request, res: Response): Promise<void> {
       mode,
       ...(space && mode !== 'web' ? { space: { spaceId: space._id, name: space.name, titles: await indexedTitles(space._id, userId) } } : {})
     };
-    // Router: deep → plan + subagents · quick "docs" → straight to the Space (the user already
-    // chose where to look) · otherwise the loop, whose tool list the mode has already filtered.
+    // Router: deep → plan + agentic subagents · quick "docs" → straight to the Space · quick web
+    // (or auto with no Space) → the fast pipeline, no Claude call before the search · quick auto
+    // WITH a Space → the loop, because choosing between documents and web is a real decision.
     const found =
       depth === 'deep'
         ? await deepSearch(query, ctx, (subQuestions) => send('plan', { subQuestions }), onTrace)
         : mode === 'docs'
           ? await searchSpaceOnly(query, ctx, onTrace)
-          : await research(query, depth, ctx, onTrace);
+          : !ctx.space
+            ? await quickSearch(query, ctx, onTrace)
+            : await research(query, depth, ctx, onTrace);
+    const memories: string[] = 'memories' in found && Array.isArray(found.memories) ? found.memories : [];
     const plan = 'plan' in found ? found.plan : undefined;
     tokens.in += found.tokens.in;
     tokens.out += found.tokens.out;
@@ -151,10 +156,16 @@ export async function ask(req: Request, res: Response): Promise<void> {
 
     // 3. the answer, token by token
     let ttftMs = 0;
-    const answer = await streamAnswer(query, found.pages, plan, (text) => {
-      if (!ttftMs) ttftMs = Date.now() - started;
-      send('token', { text });
-    });
+    const answer = await streamAnswer(
+      query,
+      found.pages,
+      plan,
+      (text) => {
+        if (!ttftMs) ttftMs = Date.now() - started;
+        send('token', { text });
+      },
+      memories
+    );
     tokens.in += answer.tokens.in;
     tokens.out += answer.tokens.out;
 

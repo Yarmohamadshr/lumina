@@ -1,7 +1,7 @@
 import type { Source, SubQuestion } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
-import { docLabel, type FetchedSource } from './loop.js';
+import { docLabel, focus, forModel, type FetchedSource } from './loop.js';
 
 /** The grounding check looks for ~12 consecutive tokens of the snippet in the real page. */
 const MIN_SNIPPET_WORDS = 12;
@@ -60,6 +60,52 @@ export function buildSources(pages: (FetchedSource & { subQuestion?: number })[]
   });
 }
 
+/**
+ * Code in an answer (`data[0]`, `rows[1]`) looks exactly like a citation to anything that reads
+ * `[n]` — our own dangling-citation check and the grader's regex alike. A prompt rule did not hold
+ * (the model still wrote data[0]), so it is enforced here, on the stream: a bracketed number that
+ * is CODE — inside a ``` block, or right after a name or `)` — becomes `[ 0 ]`, which is still valid
+ * Python and JS. A `[7]` in prose is left exactly as written: if it cites nothing, that is a real
+ * failure and the run must still fail loud.
+ */
+export function codeBracketGuard() {
+  let pending = '';
+  let inFence = false;
+  let prev = '';
+  const inCode = (s: string) => s.replace(/\[(\d{1,3})\]/g, '[ $1 ]');
+  const inProse = (s: string) =>
+    s.replace(/\[(\d{1,3})\]/g, (all, d: string, at: number) => {
+      const before = at > 0 ? s[at - 1]! : prev;
+      return /[A-Za-z0-9_)]/.test(before) ? `[ ${d} ]` : all;
+    });
+  const process = (s: string) => {
+    let out = '';
+    s.split('```').forEach((part, i) => {
+      if (i > 0) {
+        out += '```';
+        inFence = !inFence;
+      }
+      out += inFence ? inCode(part) : inProse(part);
+    });
+    if (out) prev = out[out.length - 1]!;
+    return out;
+  };
+  return {
+    /** Text in, safe text out. Holds back a tail that could be half a `[12]` or half a fence. */
+    push(text: string): string {
+      const s = pending + text;
+      const tail = /(\[\d{0,3}|`{1,2})$/.exec(s);
+      pending = tail ? tail[0] : '';
+      return process(tail ? s.slice(0, tail.index) : s);
+    },
+    flush(): string {
+      const s = pending;
+      pending = '';
+      return process(s);
+    }
+  };
+}
+
 const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provided.
 - Put a citation like [1] after every factual claim, using only the source numbers given.
 - If the sources do not answer the question, say so plainly. Never use outside knowledge.
@@ -67,7 +113,9 @@ const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provi
 - Write PLAIN TEXT. No markdown: no **bold**, no ## headings, no backticks, no bullet characters.
   The UI renders the text as it arrives, so markdown symbols show up literally and look broken.
   For a list, write one short sentence per line instead.
-- Keep the whole answer under 200 words. Answer the question asked; do not summarise the sources.`;
+- Keep the whole answer under 200 words. Answer the question asked; do not summarise the sources.
+- Square brackets holding a number are ALWAYS read as citations. In code, never put a number
+  directly inside square brackets: write items[i] with a named index, or first = items[:1], never items[0].`;
 
 /**
  * Step 5: stream the answer. `onText` is called for every piece of text as it arrives.
@@ -77,7 +125,9 @@ export async function streamAnswer(
   query: string,
   pages: (FetchedSource & { subQuestion?: number })[],
   plan: SubQuestion[] | undefined,
-  onText: (text: string) => void
+  onText: (text: string) => void,
+  /** What recall_memory returned: how this user wants answers. Shapes the answer, is never cited. */
+  memories: string[] = []
 ): Promise<{ text: string; tokens: { in: number; out: number } }> {
   const context = pages.length
     ? pages
@@ -85,7 +135,7 @@ export async function streamAnswer(
           (p) =>
             `[${p.n}] ${p.kind === 'doc' ? `${docLabel(p.title, p.locator)} (the user's own document)` : p.title}` +
             `${p.subQuestion ? ` (sub-question ${p.subQuestion})` : ''}\n${p.kind === 'web' ? `${p.url}\n` : ''}` +
-            p.text.slice(0, PAGE_CHARS_FOR_MODEL)
+            forModel(focus(p.text, query, PAGE_CHARS_FOR_MODEL))
         )
         .join('\n\n---\n\n')
     : '(no sources were found)';
@@ -105,12 +155,25 @@ Keep it under 400 words in total.`
     model: env.llmModel,
     max_tokens: plan?.length ? 2000 : 1200,
     thinking: { type: 'disabled' }, // no tools in this call; skipping thinking gets the first token out sooner
-    system: ANSWER_SYSTEM + deep,
+    system:
+      ANSWER_SYSTEM +
+      deep +
+      (memories.length
+        ? `\nWhat you know about this user (apply it to HOW you answer; it is not a source, never cite it):\n${memories.map((m) => `- ${m}`).join('\n')}`
+        : ''),
     messages: [{ role: 'user', content: `Sources:\n\n${context}\n\nQuestion: ${query}` }]
   });
-  stream.on('text', onText);
+  // What the user sees and what the citation check reads are the SAME guarded text.
+  const guard = codeBracketGuard();
+  let text = '';
+  const emit = (t: string) => {
+    if (!t) return;
+    text += t;
+    onText(t);
+  };
+  stream.on('text', (t) => emit(guard.push(t)));
 
   const final = await stream.finalMessage();
-  const text = final.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('');
+  emit(guard.flush());
   return { text, tokens: { in: final.usage.input_tokens, out: final.usage.output_tokens } };
 }
