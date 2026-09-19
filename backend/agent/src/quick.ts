@@ -89,13 +89,21 @@ async function triage(query: string, history: Anthropic.MessageParam[], memories
   // in Bash. So a query that ADDS words (the remembered preference) is used either way.
   const q = input.searchQuery?.trim();
   const addsWords = !!q && memories.length > 0 && [...words(q)].some((w) => !words(query).has(w));
-  const rewrite = q && (history.length || memories.length) && (input.needsRewrite || addsWords) ? q : undefined;
+  // A follow-up rewrite also needs the message to actually point back at something. Haiku said
+  // "needs rewrite" for "How do you measure citation grounding without an LLM judge?" (which stands
+  // alone), and the second search + restarted answer cost 1.5–2.5 s of TTFT on a bench question.
+  const followUp = history.length > 0 && !!input.needsRewrite && REFERS_BACK.test(query);
+  const rewrite = q && (followUp || addsWords) ? q : undefined;
   return {
     ...(rewrite ? { query: rewrite } : {}),
     ...(input.durableFact?.trim() ? { saveMemory: input.durableFact.trim() } : {}),
     tokens: { in: res.usage.input_tokens, out: res.usage.output_tokens }
   };
 }
+
+/** Words and openings that only make sense with the conversation before them. */
+const REFERS_BACK =
+  /\b(it|its|it's|that|this|these|those|they|them|their|there|he|she|him|her|his|same|above|previous|former|latter|one)\b|^\s*(and|but|also|so|what about|how about|then)\b/i;
 
 const norm = (q: string) => q.trim().toLowerCase().replace(/\s+/g, ' ');
 const STOP = new Set(['the', 'and', 'for', 'how', 'what', 'with', 'does', 'can', 'you', 'your', 'are', 'use', 'using']);

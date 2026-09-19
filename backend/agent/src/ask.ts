@@ -204,6 +204,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       const decision = await start.decision;
       // What the gate actually decided on: a check still running at the gate did not replace anything.
       const replaced = result.aborted ? await start.check : null;
+      if (result.aborted) (res.locals.restartReason = decision.rewrite ? `rewrite: ${decision.rewrite}` : 'replace: a page failed the live check');
       addTokens(decision.tokens, env.plannerModel);
       addTokens(result.tokens, env.quickAnswerModel); // a cancelled answer still cost its input
       let pages = start.pages;
@@ -270,7 +271,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       ...(plan ? { subQuestions: plan.length } : {})
     });
     // What /stats reads off this request's row.
-    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached ?? false, ...(Object.keys(phases).length ? { phases } : {}) };
+    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached ?? false, ...(Object.keys(phases).length ? { phases } : {}), ...(res.locals.restartReason ? { restartReason: res.locals.restartReason } : {}) };
     send('done', done);
     res.end();
 
