@@ -39,7 +39,7 @@ const PLAN_TOOL: Anthropic.Tool = {
           type: 'object',
           properties: {
             question: { type: 'string', description: 'One self-contained sub-question, searchable on its own' },
-            reason: { type: 'string', description: 'One line: why this part matters to the whole question' }
+            reason: { type: 'string', description: 'Why this part matters, in at most 10 words' }
           },
           required: ['question', 'reason']
         }
@@ -55,22 +55,54 @@ const PLANNER_SYSTEM = `You plan research. Break the question into ${env.deepSub
 - Each must be self-contained: a researcher sees only that sentence, not the original question.
 - Ask what a careful person would actually want to know: costs, limits, alternatives, what breaks,
   what changes at scale, what the evidence actually says.
-- Give each a one-line reason. Call plan_research exactly once.`;
+- Give each a reason of at most 10 words. Keep sub-questions short (under 20 words).
+- Call plan_research exactly once.`;
 
 /**
  * The plan: ONE model call, before any retrieval, so the reader sees what the system decided to go
  * and find out. A deep search that streams no plan is just a slow quick search.
  */
+/** If the planner has not answered by now, a second identical request races the first. */
+const PLAN_HEDGE_MS = 2000;
+
 export async function planResearch(query: string): Promise<{ plan: SubQuestion[]; tokens: { in: number; out: number } }> {
-  const response = await llm.messages.create({
-    // The plan is the deep search's first paint and the SLA gives it 4 s, so it runs on the fast
-    // model. The ANSWER still comes from env.llmModel, which is what /health names.
-    model: env.plannerModel,
-    max_tokens: 700,
-    system: PLANNER_SYSTEM,
-    tools: [PLAN_TOOL],
-    tool_choice: { type: 'tool', name: 'plan_research' },
-    messages: [{ role: 'user', content: query }]
+  // The plan is the deep search's first paint and the SLA gives it 4 s, so it runs on the fast model
+  // (the ANSWER still comes from env.llmModel, which is what /health names). It usually takes ~3 s,
+  // and one slow call (6.7 s in bench run 6) failed the p95 of 4 deep runs on its own. So a HEDGED
+  // request: past PLAN_HEDGE_MS a second identical call starts, the first to finish wins and the
+  // other is cancelled. It costs ~$0.002, and only on slow runs.
+  const ask = (signal: AbortSignal) =>
+    llm.messages.create(
+      {
+        model: env.plannerModel,
+        max_tokens: 700,
+        system: PLANNER_SYSTEM,
+        tools: [PLAN_TOOL],
+        tool_choice: { type: 'tool', name: 'plan_research' },
+        messages: [{ role: 'user', content: query }]
+      },
+      { signal }
+    );
+  const first = new AbortController();
+  const second = new AbortController();
+  let hedge: ReturnType<typeof setTimeout> | undefined;
+  const response = await new Promise<Anthropic.Message>((resolve, reject) => {
+    let started = 1;
+    let failed = 0;
+    // First success wins. A failure only ends the plan once every request started so far has failed.
+    const race = (p: Promise<Anthropic.Message>) =>
+      p.then(resolve, (err: unknown) => {
+        if (++failed === started) reject(err); // fail loud: a real provider failure
+      });
+    race(ask(first.signal));
+    hedge = setTimeout(() => {
+      started++;
+      race(ask(second.signal));
+    }, PLAN_HEDGE_MS);
+  }).finally(() => {
+    clearTimeout(hedge);
+    first.abort(); // cancel the loser (aborting a finished request is a no-op)
+    second.abort();
   });
 
   const call = response.content.find((b) => b.type === 'tool_use');
