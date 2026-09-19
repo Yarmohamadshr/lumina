@@ -29,6 +29,7 @@ const PAGES_TRIED = 4;
 const HISTORY_FOR_REWRITE = 4;
 
 type Triage = { query?: string; saveMemory?: string; tokens: { in: number; out: number } };
+const NO_TRIAGE: Triage = { tokens: { in: 0, out: 0 } };
 
 const TRIAGE_TOOL: Anthropic.Tool = {
   name: 'triage',
@@ -88,7 +89,10 @@ async function triage(query: string, history: Anthropic.MessageParam[], memories
   // TypeScript" but answered needsRewrite=false, the search stayed generic, and the answer came back
   // in Bash. So a query that ADDS words (the remembered preference) is used either way.
   const q = input.searchQuery?.trim();
-  const addsWords = !!q && memories.length > 0 && [...words(q)].some((w) => !words(query).has(w));
+  // A memory-shaped rewrite must add words that come FROM the memories ("Python"). Any other added
+  // word is just Haiku rewording a standalone question, and it cost a second search + a restart.
+  const remembered = words(memories.join(' '));
+  const addsWords = !!q && [...words(q)].some((w) => !words(query).has(w) && remembered.has(w));
   // A follow-up rewrite also needs the message to actually point back at something. Haiku said
   // "needs rewrite" for "How do you measure citation grounding without an LLM judge?" (which stands
   // alone), and the second search + restarted answer cost 1.5–2.5 s of TTFT on a bench question.
@@ -96,10 +100,18 @@ async function triage(query: string, history: Anthropic.MessageParam[], memories
   const rewrite = q && (followUp || addsWords) ? q : undefined;
   return {
     ...(rewrite ? { query: rewrite } : {}),
-    ...(input.durableFact?.trim() ? { saveMemory: input.durableFact.trim() } : {}),
+    ...(input.durableFact?.trim() && ABOUT_ME.test(query) ? { saveMemory: input.durableFact.trim() } : {}),
     tokens: { in: res.usage.input_tokens, out: res.usage.output_tokens }
   };
 }
+
+/**
+ * The user saying something about THEMSELVES — the only kind of message that can hold a memory.
+ * Without this gate Haiku "saved" facts from plain questions ("What is prompt caching and when does
+ * it save money?" → "User wants to understand cost-saving mechanisms…"): a log, not a memory.
+ */
+const ABOUT_ME =
+  /\b(i am|i'm|i work|i use|i build|i code|i write|i prefer|i like|i love|i hate|i want|i need|i always|i never|i only|my name|call me|i'm a|as a)\b|\b(always|never)\b|\bprefer|\bfrom now on\b|\b(answer|respond|reply|write|talk|explain)\s+(to me\s+)?(in|with|using|like)\b/i;
 
 /** Words and openings that only make sense with the conversation before them. */
 const REFERS_BACK =
@@ -198,8 +210,13 @@ export async function quickStart(query: string, ctx: ResearchContext, emit: (ev:
 
   // Haiku starts WITHOUT the memories so it is not waiting on the recall; only a user who HAS
   // memories gets a second, informed call (a stated preference can change what to search).
+  // Haiku only runs when it can change something: the message is about the user (a memory to save),
+  // it points back at the conversation (a follow-up to rewrite), or the user has memories (a
+  // preference that may shape the search). A plain factual question skips it: no wait, no cost —
+  // and no exposure to a Haiku latency spike (one took 6.4 s and held the answer back).
+  const mayMatter = ABOUT_ME.test(query) || (ctx.history.length > 0 && REFERS_BACK.test(query));
   const recalled = timed(() => recallMemory(ctx.userId, query));
-  const blind = triage(query, ctx.history, []);
+  const blind = mayMatter ? triage(query, ctx.history, []) : Promise.resolve(NO_TRIAGE);
   // When the informed call replaces it, nobody awaits `blind`: without this, an error in it would be
   // an unhandled rejection, which crashes the process. When it IS used, the await still rethrows.
   blind.catch(() => undefined);
