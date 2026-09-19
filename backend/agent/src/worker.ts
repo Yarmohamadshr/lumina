@@ -54,10 +54,22 @@ async function claim(): Promise<JobDoc | null> {
   );
 }
 
-/** The janitor: a job stuck `running` with an old claimedAt goes back to `pending`. */
+/**
+ * The janitor: a job stuck `running` with an old claimedAt goes back to `pending` — unless it has
+ * already been tried MAX_ATTEMPTS times. A file that kills the worker itself (out of memory on a
+ * huge PDF) never reaches handle()'s catch, so without this it would crash the worker forever.
+ */
 async function sweep(): Promise<void> {
+  const stale = { status: 'running' as const, claimedAt: { $lt: new Date(Date.now() - STALE_MS) } };
+  const dead = await (await jobs()).find({ ...stale, attempts: { $gte: MAX_ATTEMPTS } }).toArray();
+  for (const job of dead) {
+    const error = `the worker stopped while indexing this file ${job.attempts} times (too large or malformed?)`;
+    await (await jobs()).updateOne({ _id: job._id }, { $set: { status: 'failed', error }, $unset: { workerId: '' } });
+    await (await documents()).updateOne({ _id: String(job.payload.docId) }, { $set: { status: 'failed', error } });
+    log.error({ jobId: job._id, docId: job.payload.docId }, error);
+  }
   const { modifiedCount } = await (await jobs()).updateMany(
-    { status: 'running', claimedAt: { $lt: new Date(Date.now() - STALE_MS) } },
+    { ...stale, attempts: { $lt: MAX_ATTEMPTS } },
     { $set: { status: 'pending' }, $unset: { workerId: '' } }
   );
   if (modifiedCount) log.warn({ modifiedCount }, 'sweeper returned stale jobs to pending');

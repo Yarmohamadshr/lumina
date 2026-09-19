@@ -1,7 +1,7 @@
 import type { Source, SubQuestion } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
-import type { FetchedSource } from './loop.js';
+import { docLabel, type FetchedSource } from './loop.js';
 
 /** The grounding check looks for ~12 consecutive tokens of the snippet in the real page. */
 const MIN_SNIPPET_WORDS = 12;
@@ -49,14 +49,15 @@ export function pickSnippet(text: string, query: string): string {
  * dropping it in the merge is the classic way to lose points on an otherwise correct fan-out.
  */
 export function buildSources(pages: (FetchedSource & { subQuestion?: number })[], query: string): Source[] {
-  return pages.map((p) => ({
-    n: p.n,
-    kind: 'web',
-    title: p.title,
-    url: p.url,
-    snippet: pickSnippet(p.text, query),
-    ...(p.subQuestion ? { subQuestion: p.subQuestion } : {})
-  }));
+  return pages.map((p) => {
+    const tag = p.subQuestion ? { subQuestion: p.subQuestion } : {};
+    // A document passage IS the retrieved text: its snippet is the chunk text verbatim, so the
+    // citation can be checked against exactly what was retrieved, with the page it came from.
+    if (p.kind === 'doc') {
+      return { n: p.n, kind: 'doc', title: p.title, docId: p.docId, locator: p.locator, snippet: p.text, ...tag };
+    }
+    return { n: p.n, kind: 'web', title: p.title, url: p.url, snippet: pickSnippet(p.text, query), ...tag };
+  });
 }
 
 const ANSWER_SYSTEM = `Answer the question using ONLY the numbered sources provided.
@@ -82,7 +83,8 @@ export async function streamAnswer(
     ? pages
         .map(
           (p) =>
-            `[${p.n}] ${p.title}${p.subQuestion ? ` (sub-question ${p.subQuestion})` : ''}\n${p.url}\n` +
+            `[${p.n}] ${p.kind === 'doc' ? `${docLabel(p.title, p.locator)} (the user's own document)` : p.title}` +
+            `${p.subQuestion ? ` (sub-question ${p.subQuestion})` : ''}\n${p.kind === 'web' ? `${p.url}\n` : ''}` +
             p.text.slice(0, PAGE_CHARS_FOR_MODEL)
         )
         .join('\n\n---\n\n')

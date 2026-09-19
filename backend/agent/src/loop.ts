@@ -1,11 +1,12 @@
 import type Anthropic from '@anthropic-ai/sdk';
-import type { AskTool, Depth, Terminated, TraceEvent } from '@lumina/contract';
+import type { AskMode, AskTool, Depth, Locator, Terminated, TraceEvent } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
 import { toolsFor } from './tools.js';
 import { fetchPage, PageUnreadableError } from './search.js';
 import { cachedWebSearch } from './cache.js';
 import { recallMemory, saveMemory } from './memory.js';
+import { hybridSearch, type DocHit } from './retrieve.js';
 
 /** The tools we have built so far. toolsFor(depth) decides which of them the model sees. */
 const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
@@ -25,6 +26,18 @@ const TOOL_DEFS: Partial<Record<AskTool, Anthropic.Tool>> = {
       type: 'object',
       properties: { url: { type: 'string', description: 'A url from web_search results' } },
       required: ['url']
+    }
+  },
+  search_documents: {
+    name: 'search_documents',
+    description:
+      "Search the user's OWN uploaded documents (their Space) by meaning and by keyword. Returns the best " +
+      'matching passages, each numbered [n] with its document and page, ready to cite. Use it for anything ' +
+      'the documents might cover, before the web.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'What to look for; the user question itself works well' } },
+      required: ['query']
     }
   },
   // The description is how the model decides when to call it, so the boundary lives here.
@@ -64,8 +77,58 @@ Today is ${new Date().toISOString().slice(0, 10)}.
 - Never repeat a search you have already run, and never call a tool twice with the same input.
 - When you have enough, reply with only the word DONE. Do not write the answer here.`;
 
-/** One page we actually fetched in this request. `n` is the number it will be cited as. */
-export type FetchedSource = { n: number; title: string; url: string; text: string };
+/**
+ * One thing we actually retrieved in this request: a web page we fetched, or a page of the
+ * user's document. `n` is the number it will be cited as, in ONE numbering for both kinds.
+ */
+export type FetchedSource = { n: number; title: string; text: string } & (
+  | { kind: 'web'; url: string }
+  | { kind: 'doc'; docId: string; locator: Locator }
+);
+
+/** Same web page, or same document page → same source. Used to dedupe within and across runs. */
+export const sourceKey = (s: FetchedSource): string =>
+  s.kind === 'web' ? s.url : `${s.docId}|${JSON.stringify(s.locator)}`;
+
+/** "retrieval-basics.pdf, p. 3" — how a document passage is labelled for the model and the UI. */
+export const docLabel = (title: string, locator: Locator): string =>
+  locator.page ? `${title}, p. ${locator.page}` : locator.heading ? `${title}, "${locator.heading}"` : `${title}, line ${locator.line}`;
+
+/**
+ * The ~`chars` of a passage that best match the query: slide a window over its sentences and keep
+ * the one sharing the most query words. The first 900 characters of a page often miss the answer
+ * ("The common default is 1.2" sits at character ~1,100 of page 1), and then the model searches
+ * again, or goes to the web, for a fact it was already handed.
+ */
+export function focus(text: string, query: string, chars: number): string {
+  if (text.length <= chars) return text;
+  const want = new Set(query.toLowerCase().match(/[a-z0-9]{2,}/g) ?? []);
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  let best = 0;
+  let bestScore = -1;
+  for (let i = 0; i < sentences.length; i++) {
+    let window = '';
+    let score = 0;
+    for (let j = i; j < sentences.length && window.length < chars; j++) {
+      window += `${sentences[j]} `;
+      score += (sentences[j]!.toLowerCase().match(/[a-z0-9]{2,}/g) ?? []).filter((w) => want.has(w)).length;
+    }
+    if (score > bestScore) [best, bestScore] = [i, score];
+  }
+  const out = sentences.slice(best).join(' ').slice(0, chars);
+  return `${best > 0 ? '… ' : ''}${out}${out.length < text.length ? ' …' : ''}`;
+}
+
+/** The same shape for a Space's passages: added to `pages` and numbered, deduped by page. */
+function addDocHits(pages: FetchedSource[], hits: DocHit[]): FetchedSource[] {
+  return hits.map((h) => {
+    const existing = pages.find((p) => p.kind === 'doc' && p.docId === h.docId && JSON.stringify(p.locator) === JSON.stringify(h.locator));
+    if (existing) return existing;
+    const page: FetchedSource = { n: pages.length + 1, kind: 'doc', title: h.title, docId: h.docId, locator: h.locator, text: h.text };
+    pages.push(page);
+    return page;
+  });
+}
 
 export type ResearchResult = {
   messages: Anthropic.MessageParam[];
@@ -84,6 +147,13 @@ export type ResearchResult = {
  * the same answer costs about half that, with no loss of quality on the pages we tested.
  */
 const PAGE_CHARS_FOR_MODEL = 2500;
+
+/**
+ * A document passage in the LOOP is only there so the model can decide what to do next: enough to
+ * see whether the Space covers the question. The answer step gets the full passage. Sending five
+ * whole pages here, resent on every turn, pushed a docs+web run to $0.060, over the $0.05 SLA.
+ */
+const DOC_CHARS_FOR_MODEL = 900;
 
 /**
  * Prompt caching: mark the end of what we have sent so far, so the NEXT call in the loop re-reads
@@ -112,6 +182,10 @@ export type ResearchContext = {
   threadId: string;
   /** The last few turns of this thread, so a follow-up question makes sense on its own. */
   history: Anthropic.MessageParam[];
+  /** Where to look (AskBody.mode). */
+  mode: AskMode;
+  /** The Space attached to this question, if any, with the titles of its indexed documents. */
+  space?: { spaceId: string; name: string; titles: string[] };
 };
 
 /**
@@ -154,8 +228,15 @@ export async function research(
   const allowed = opts.subQuestion
     ? toolsFor('quick').filter((t) => t !== 'recall_memory' && t !== 'save_memory')
     : toolsFor(depth);
-  const tools = allowed.flatMap((name) => TOOL_DEFS[name] ?? []);
-  const system = opts.extraSystem ? `${SYSTEM}\n${opts.extraSystem}` : SYSTEM;
+  // The router, as a gate: no Space → no search_documents; mode "web" → no documents; mode "docs"
+  // → no web. What the model cannot see it cannot call, whatever the prompt says.
+  const routed = allowed.filter((t) => {
+    if (t === 'search_documents') return !!ctx.space && ctx.mode !== 'web';
+    if (t === 'web_search' || t === 'fetch_page') return ctx.mode !== 'docs';
+    return true;
+  });
+  const tools = routed.flatMap((name) => TOOL_DEFS[name] ?? []);
+  const system = [SYSTEM, spaceInstructions(ctx), opts.extraSystem].filter(Boolean).join('\n');
 
   const messages: Anthropic.MessageParam[] = [...ctx.history, { role: 'user', content: query }];
   const pages: FetchedSource[] = [];
@@ -166,6 +247,7 @@ export async function research(
   let nudged = false; // the "fetch a page first" nudge is sent at most once
   let searches = 0;
   let cachedSearches = 0;
+  let searchedDocs = false;
 
   const result = (terminated: 'done' | 'cap'): ResearchResult => ({
     messages,
@@ -203,9 +285,11 @@ export async function research(
         messages.push({ role: 'assistant', content: response.content });
         messages.push({
           role: 'user',
-          content: titles.size
-            ? 'You have not fetched any page yet, and the answer can only use pages fetched in this request. Call fetch_page on the most relevant search result.'
-            : 'You have not searched yet. Earlier turns in this conversation are context, not sources: the answer may only use pages fetched in THIS request. Call web_search now, then fetch_page.'
+          content: routed.includes('search_documents') && !searchedDocs
+            ? "You have not retrieved anything yet, and the answer can only use what is retrieved in THIS request. Call search_documents now."
+            : titles.size
+              ? 'You have not fetched any page yet, and the answer can only use pages fetched in this request. Call fetch_page on the most relevant search result.'
+              : 'You have not searched yet. Earlier turns in this conversation are context, not sources: the answer may only use pages fetched in THIS request. Call web_search now, then fetch_page.'
         });
         continue;
       }
@@ -281,18 +365,33 @@ export async function research(
 
     if (name === 'fetch_page') {
       if (typeof input.url !== 'string' || !input.url.startsWith('http')) return { ok: false, content: 'fetch_page needs a url' };
-      const already = pages.find((p) => p.url === input.url);
+      const already = pages.find((p) => p.kind === 'web' && p.url === input.url);
       if (already) return { ok: true, content: `Already fetched as [${already.n}].` };
       try {
         const page = await fetchPage(input.url);
         const n = pages.length + 1;
         const title = titles.get(input.url) ?? page.url;
-        pages.push({ n, title, url: page.url, text: page.text });
+        pages.push({ n, kind: 'web', title, url: page.url, text: page.text });
         return { ok: true, content: `[${n}] ${title}\n${page.text.slice(0, PAGE_CHARS_FOR_MODEL)}` };
       } catch (err) {
         if (err instanceof PageUnreadableError) return { ok: false, content: err.message };
         throw err; // provider failure: fail loud
       }
+    }
+
+    if (name === 'search_documents') {
+      if (typeof input.query !== 'string' || !input.query.trim()) return { ok: false, content: 'search_documents needs a query' };
+      if (!ctx.space) return { ok: false, content: 'no Space is attached to this question' };
+      searchedDocs = true;
+      const key = `docs:${input.query.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+      const before = searched.get(key);
+      if (before !== undefined) return { ok: true, content: `Already searched this. Same passages:\n${before}` };
+      const found = addDocHits(pages, await hybridSearch(ctx.space.spaceId, ctx.userId, input.query));
+      const content = found.length
+        ? found.map((p) => `[${p.n}] ${p.kind === 'doc' ? docLabel(p.title, p.locator) : p.title}\n${focus(p.text, String(input.query), DOC_CHARS_FOR_MODEL)}`).join('\n\n')
+        : 'No matching passages in this Space.';
+      searched.set(key, content);
+      return { ok: true, content };
     }
 
     if (name === 'save_memory') {
@@ -311,4 +410,43 @@ export async function research(
     // toolsFor + TOOL_DEFS mean the model never sees another tool; if it names one anyway, refuse.
     return { ok: false, content: `tool ${name} is not available` };
   }
+}
+
+/** What the model is told about an attached Space. The tool list is the gate; this is the steer. */
+function spaceInstructions(ctx: ResearchContext): string {
+  if (!ctx.space || ctx.mode === 'web') return '';
+  const docs = ctx.space.titles.length ? ctx.space.titles.map((t) => `"${t}"`).join(', ') : '(none indexed yet)';
+  if (ctx.mode === 'docs') {
+    return `The user asked you to answer from their Space "${ctx.space.name}" only (documents: ${docs}). Call search_documents; do not use the web.`;
+  }
+  return `The user attached their Space "${ctx.space.name}" with these documents: ${docs}.
+- Call search_documents FIRST on every question: their own documents come before the web.
+- If the passages answer the question, stop there. Use web_search and fetch_page as well only when the
+  documents do not cover it, or the question is about the outside world (news, markets, other companies).`;
+}
+
+/**
+ * mode "docs" on a quick run: the user already chose where to look, so there is no routing
+ * decision left for a model to make. Search the Space with the question itself — one retrieval,
+ * no LLM round trip before it — and hand the passages to the answer step. Faster and cheaper
+ * than a loop that would make exactly this call anyway.
+ */
+export async function searchSpaceOnly(
+  query: string,
+  ctx: ResearchContext,
+  emit: (ev: TraceEvent) => void
+): Promise<ResearchResult> {
+  if (!ctx.space) throw new Error('searchSpaceOnly needs a Space');
+  const t0 = Date.now();
+  const pages: FetchedSource[] = [];
+  addDocHits(pages, await hybridSearch(ctx.space.spaceId, ctx.userId, query));
+  emit({
+    step: 1,
+    tool: 'search_documents',
+    input: { query, spaceId: ctx.space.spaceId },
+    ok: true,
+    ms: Date.now() - t0,
+    reason: `Answering from the Space "${ctx.space.name}" only (mode: docs): searching its documents for the question.`
+  });
+  return { messages: [], pages, terminated: 'done', tokens: { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 }, toolCalls: 1, searchCached: false };
 }

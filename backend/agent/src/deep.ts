@@ -2,7 +2,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { PlanEvent, type SubQuestion, type TraceEvent } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
-import { newBudget, research, type FetchedSource, type ResearchContext } from './loop.js';
+import { newBudget, research, sourceKey, type FetchedSource, type ResearchContext } from './loop.js';
 
 /**
  * How many subagents run at once, from DEEP_CONCURRENCY. Three, not all of them: six subagents
@@ -151,10 +151,10 @@ export async function deepSearch(
     tokens.cacheRead += r.tokens.cacheRead;
   }
 
-  // ---- merge: dedupe by url, renumber contiguously from 1, keep the tag
-  const byUrl = new Map<string, DeepSource>();
-  for (const page of results.flatMap((r) => r.pages)) if (!byUrl.has(page.url)) byUrl.set(page.url, page);
-  const pages = [...byUrl.values()].map((p, i) => ({ ...p, n: i + 1 }));
+  // ---- merge: dedupe by url (or document page), renumber contiguously from 1, keep the tag
+  const byKey = new Map<string, DeepSource>();
+  for (const page of results.flatMap((r) => r.pages)) if (!byKey.has(sourceKey(page))) byKey.set(sourceKey(page), page);
+  const pages = [...byKey.values()].map((p, i) => ({ ...p, n: i + 1 }));
 
   return {
     plan,

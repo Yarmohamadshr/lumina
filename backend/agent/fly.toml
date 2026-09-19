@@ -6,6 +6,13 @@ primary_region = "iad"
 
 [build]
 
+# Two process groups, same image, same secrets, separate Machines (DESIGN Q1): the worker parses
+# PDFs on its own CPU and memory, so an ingest can never stall an answer stream. Only `app`
+# serves HTTP; the gateway reaches it at app.process.lumina-agent-shr.internal.
+[processes]
+app = "node dist/index.js"
+worker = "node dist/worker.js"
+
 [env]
 PORT_AGENT = "8000"
 NODE_ENV = "production"

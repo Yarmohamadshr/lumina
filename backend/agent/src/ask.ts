@@ -16,13 +16,15 @@ import {
 } from '@lumina/contract';
 import { env } from './env.js';
 import { costUsd } from './llm.js';
-import { research } from './loop.js';
+import { research, searchSpaceOnly, type ResearchContext } from './loop.js';
 import { deepSearch } from './deep.js';
 import { deepRunsToday } from './runlog.js';
 import { buildSources, streamAnswer } from './answer.js';
 import { saveRun } from './runlog.js';
 import { findThread, messages, recentHistory, titleFromFirstQuestion } from './threads.js';
 import { sseHeaders, sseSend } from './sse.js';
+import { findSpace } from './spaces.js';
+import { indexedTitles } from './retrieve.js';
 
 const log = pino({ level: env.logLevel });
 
@@ -47,13 +49,24 @@ export async function ask(req: Request, res: Response): Promise<void> {
     res.status(400).json({ error: body.error.issues.map((i) => i.message).join('; '), status: 400, requestId });
     return;
   }
-  const { query, depth } = body.data;
+  const { query, depth, mode, spaceId } = body.data;
 
   // The thread must exist and be this user's. Checked before anything is streamed or spent.
   if (!(await findThread(thread.data, userId))) {
     res.status(404).json({ error: 'thread not found', status: 404, requestId });
     return;
   }
+  // The Space, if one is attached: it must be this user's. mode "docs" without one has nothing to search.
+  if (mode === 'docs' && !spaceId) {
+    res.status(400).json({ error: 'mode "docs" needs a spaceId', status: 400, requestId });
+    return;
+  }
+  const space = spaceId ? await findSpace(spaceId, userId) : null;
+  if (spaceId && !space) {
+    res.status(404).json({ error: 'space not found', status: 404, requestId });
+    return;
+  }
+
   // The spend gate, BEFORE any provider call: deep costs several times more, so a user over their
   // daily cap is refused having spent nothing. It lives here in the AGENT, which is not publicly
   // reachable — a cap on the edge is a cap you can bypass by calling the agent directly.
@@ -111,11 +124,21 @@ export async function ask(req: Request, res: Response): Promise<void> {
       toolCalls.push({ name: ev.tool, ok: ev.ok, ms: ev.ms, ...(ev.error ? { error: ev.error } : {}) });
       send('trace', ev);
     };
-    const ctx = { userId, threadId: thread.data, history };
+    const ctx: ResearchContext = {
+      userId,
+      threadId: thread.data,
+      history,
+      mode,
+      ...(space && mode !== 'web' ? { space: { spaceId: space._id, name: space.name, titles: await indexedTitles(space._id, userId) } } : {})
+    };
+    // Router: deep → plan + subagents · quick "docs" → straight to the Space (the user already
+    // chose where to look) · otherwise the loop, whose tool list the mode has already filtered.
     const found =
       depth === 'deep'
         ? await deepSearch(query, ctx, (subQuestions) => send('plan', { subQuestions }), onTrace)
-        : await research(query, depth, ctx, onTrace);
+        : mode === 'docs'
+          ? await searchSpaceOnly(query, ctx, onTrace)
+          : await research(query, depth, ctx, onTrace);
     const plan = 'plan' in found ? found.plan : undefined;
     tokens.in += found.tokens.in;
     tokens.out += found.tokens.out;
