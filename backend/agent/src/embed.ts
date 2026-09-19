@@ -18,3 +18,18 @@ export async function embed(text: string): Promise<number[]> {
   }
   return vector;
 }
+
+/**
+ * Many texts in ONE call: a 60-page PDF is ~150 chunks, and 150 separate calls would be slow
+ * and rate-limited. OpenAI returns one vector per input; `index` says which, so re-sort by it.
+ * Same rule as embed(): any missing or wrong-sized vector fails the whole batch, loudly.
+ */
+export async function embedMany(texts: string[]): Promise<number[][]> {
+  if (!texts.length) return [];
+  const res = await openai.embeddings.create({ model: env.embeddingModel, input: texts });
+  const vectors = [...res.data].sort((a, b) => a.index - b.index).map((d) => d.embedding);
+  if (vectors.length !== texts.length || vectors.some((v) => v?.length !== EMBEDDING_DIMS)) {
+    throw new Error(`embedding failed: expected ${texts.length} vectors of ${EMBEDDING_DIMS} dims`);
+  }
+  return vectors;
+}
