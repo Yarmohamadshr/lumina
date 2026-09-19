@@ -15,7 +15,9 @@ const TAVILY = 'https://api.tavily.com';
  */
 const UNVERIFIABLE_SITES = [
   'instagram.com', 'facebook.com', 'tiktok.com', 'youtube.com', 'x.com', 'twitter.com',
-  'linkedin.com', 'pinterest.com', 'quora.com', 'brainly.com', 'brainly.in', 'brainly.ph'
+  'linkedin.com', 'pinterest.com', 'quora.com', 'brainly.com', 'brainly.in', 'brainly.ph',
+  // Archived copies: the snippet picked from them was the archive's own banner text.
+  'web.archive.org'
 ];
 
 /**
@@ -64,8 +66,14 @@ export async function webSearch(query: string, max = 5): Promise<SearchHit[]> {
  * Content:") that is NOT on the page. On a page with no long paragraph the snippet fell back to that
  * header, and the citation could not be found in the real HTML. Keep only the page's own text.
  */
-function pageTextOnly(text: string): string {
-  return text.replace(/^(?:\s*(?:Title|URL Source|Published Time|Markdown Content):[^\n]*\n)+/, '').trim();
+export function pageTextOnly(text: string): string {
+  // The header is not always first: the text can open with the page title, THEN "Title: …".
+  const lines = text.split('\n');
+  const HEADER = /^\s*(Title|URL Source|Published Time|Markdown Content):/;
+  return lines
+    .filter((line, i) => !(i < 8 && HEADER.test(line)))
+    .join('\n')
+    .trim();
 }
 
 /** fetch_page: a url in, its readable text out. Throws if Tavily could not read the page. */

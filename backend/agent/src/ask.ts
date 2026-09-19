@@ -9,6 +9,8 @@ import {
   ThreadId,
   unresolvedCitations,
   type MessageDoc,
+  type Source,
+  type SubQuestion,
   type RunLog,
   type SseEventName,
   type TraceEvent,
@@ -16,8 +18,8 @@ import {
 } from '@lumina/contract';
 import { env } from './env.js';
 import { costUsd } from './llm.js';
-import { research, searchSpaceOnly, type ResearchContext } from './loop.js';
-import { quickSearch } from './quick.js';
+import { research, searchSpaceOnly, type FetchedSource, type ResearchContext } from './loop.js';
+import { quickFinish, quickStart } from './quick.js';
 import { deepSearch } from './deep.js';
 import { deepRunsToday } from './runlog.js';
 import { buildSources, streamAnswer } from './answer.js';
@@ -113,6 +115,9 @@ export async function ask(req: Request, res: Response): Promise<void> {
   // What the run log records, filled in as the run goes.
   const toolCalls: RunLog['toolCalls'] = [];
   const tokens = { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 };
+  // Priced per model as tokens come in: a quick run is Haiku throughout, a deep run mostly Sonnet.
+  let spentUsd = 0;
+  let answerModel = env.llmModel;
   let terminated: Terminated = 'error';
   let answerId: string | undefined;
   let assistantMessage: MessageDoc | undefined; // saved after the stream closes
@@ -132,42 +137,92 @@ export async function ask(req: Request, res: Response): Promise<void> {
       mode,
       ...(space && mode !== 'web' ? { space: { spaceId: space._id, name: space.name, titles: await indexedTitles(space._id, userId) } } : {})
     };
-    // Router: deep → plan + agentic subagents · quick "docs" → straight to the Space · quick web
-    // (or auto with no Space) → the fast pipeline, no Claude call before the search · quick auto
-    // WITH a Space → the loop, because choosing between documents and web is a real decision.
-    const found =
-      depth === 'deep'
-        ? await deepSearch(query, ctx, (subQuestions) => send('plan', { subQuestions }), onTrace)
-        : mode === 'docs'
-          ? await searchSpaceOnly(query, ctx, onTrace)
-          : !ctx.space
-            ? await quickSearch(query, ctx, onTrace)
-            : await research(query, depth, ctx, onTrace);
-    const memories: string[] = 'memories' in found && Array.isArray(found.memories) ? found.memories : [];
-    const plan = 'plan' in found ? found.plan : undefined;
-    tokens.in += found.tokens.in;
-    tokens.out += found.tokens.out;
-    tokens.cacheWrite += found.tokens.cacheWrite;
-    tokens.cacheRead += found.tokens.cacheRead;
-
-    // 2. sources, BEFORE the first token (validated against the contract)
-    const sources = SourcesEvent.parse(buildSources(found.pages, query));
-    send('sources', sources);
-
-    // 3. the answer, token by token
     let ttftMs = 0;
-    const answer = await streamAnswer(
-      query,
-      found.pages,
-      plan,
-      (text) => {
-        if (!ttftMs) ttftMs = Date.now() - started;
-        send('token', { text });
-      },
-      memories
-    );
-    tokens.in += answer.tokens.in;
-    tokens.out += answer.tokens.out;
+    const onToken = (text: string) => {
+      if (!ttftMs) ttftMs = Date.now() - started;
+      send('token', { text });
+    };
+    const addTokens = (t: { in: number; out: number; cacheWrite?: number; cacheRead?: number }, model: string = env.llmModel) => {
+      spentUsd += costUsd(t, model);
+      tokens.in += t.in;
+      tokens.out += t.out;
+      tokens.cacheWrite += t.cacheWrite ?? 0;
+      tokens.cacheRead += t.cacheRead ?? 0;
+    };
+
+    // Router: deep → plan + agentic subagents · quick "docs" → straight to the Space · quick web
+    // (or auto with no Space) → the fast pipeline · quick auto WITH a Space → the loop, because
+    // choosing between documents and web is a real decision.
+    let found: { pages: FetchedSource[]; terminated: 'done' | 'cap'; searchCached?: boolean; plan?: SubQuestion[] };
+    let sources: Source[];
+    let answer: { text: string; tokens: { in: number; out: number } };
+
+    if (depth === 'quick' && mode !== 'docs' && !ctx.space) {
+      // Fast pipeline, with a SPECULATIVE answer: Claude starts writing from the search of the
+      // question as asked while Haiku's triage finishes. Nothing reaches the user until the triage
+      // agrees; then sources, then the held tokens. Haiku's ~0.8 s hides inside Claude's own start.
+      const start = await quickStart(query, ctx, onTrace);
+      sources = SourcesEvent.parse(buildSources(start.pages, query));
+      const first = sources;
+      // The gate opens only when BOTH agree: Haiku (no rewrite needed) and the live citation check
+      // (every chosen page really shows its quote). Either one saying no cancels the speculation.
+      let result = await streamAnswer(
+        query,
+        start.pages,
+        undefined,
+        onToken,
+        start.memories,
+        { gate: Promise.all([start.decision, start.check]).then(([d, replaced]) => !d.rewrite && !replaced), onOpen: () => send('sources', first) },
+        env.quickAnswerModel
+      );
+      answerModel = env.quickAnswerModel;
+      const decision = await start.decision;
+      const replaced = await start.check;
+      addTokens(decision.tokens, env.plannerModel);
+      addTokens(result.tokens, env.quickAnswerModel); // a cancelled answer still cost its input
+      let pages = start.pages;
+      let searchCached = start.searchCached;
+      if (result.aborted) {
+        if (decision.rewrite) {
+          // The question needed its standalone form: search again and answer from THAT.
+          const snippetQuery = `${query} ${decision.rewrite}`;
+          const fin = await quickFinish(decision.rewrite, snippetQuery, onTrace, start.steps());
+          pages = fin.pages;
+          searchCached = searchCached && fin.searchCached;
+          sources = SourcesEvent.parse(buildSources(pages, snippetQuery));
+        } else {
+          // A chosen page failed the live check: answer from the pages that passed.
+          pages = replaced ?? start.pages;
+          sources = SourcesEvent.parse(buildSources(pages, query));
+        }
+        send('sources', sources);
+        result = await streamAnswer(query, pages, undefined, onToken, start.memories, undefined, env.quickAnswerModel);
+        addTokens(result.tokens, env.quickAnswerModel);
+      }
+      found = { pages, terminated: 'done', searchCached };
+      answer = result;
+    } else {
+      const res =
+        depth === 'deep'
+          ? await deepSearch(query, ctx, (subQuestions) => send('plan', { subQuestions }), onTrace)
+          : mode === 'docs'
+            ? await searchSpaceOnly(query, ctx, onTrace)
+            : await research(query, depth, ctx, onTrace);
+      addTokens(res.tokens);
+      found = {
+        pages: res.pages,
+        terminated: res.terminated,
+        ...('searchCached' in res ? { searchCached: res.searchCached } : {}),
+        ...('plan' in res ? { plan: res.plan } : {})
+      };
+      // 2. sources, BEFORE the first token (validated against the contract)
+      sources = SourcesEvent.parse(buildSources(found.pages, query));
+      send('sources', sources);
+      // 3. the answer, token by token
+      answer = await streamAnswer(query, found.pages, found.plan, onToken);
+      addTokens(answer.tokens);
+    }
+    const plan = found.plan;
 
     // 4. every [n] must resolve to a source retrieved in THIS request
     const dangling = unresolvedCitations(answer.text, sources);
@@ -180,16 +235,16 @@ export async function ask(req: Request, res: Response): Promise<void> {
       answerId,
       latencyMs: Date.now() - started,
       ttftMs,
-      model: env.llmModel,
+      model: answerModel,
       tokens: { in: tokens.in + tokens.cacheWrite + tokens.cacheRead, out: tokens.out },
-      costUsd: costUsd(tokens),
-      searchCached: 'searchCached' in found ? found.searchCached : false,
+      costUsd: spentUsd,
+      searchCached: found.searchCached ?? false,
       terminated,
       depth,
       ...(plan ? { subQuestions: plan.length } : {})
     });
     // What /stats reads off this request's row.
-    res.locals.requestExtras = { ttftMs, searchCached: 'searchCached' in found ? found.searchCached : false };
+    res.locals.requestExtras = { ttftMs, searchCached: found.searchCached ?? false };
     send('done', done);
     res.end();
 
@@ -235,7 +290,7 @@ export async function ask(req: Request, res: Response): Promise<void> {
       query,
       tokens: tokens.in + tokens.cacheWrite + tokens.cacheRead + tokens.out,
       wallClockSec: (Date.now() - started) / 1000,
-      costUsd: costUsd(tokens),
+      costUsd: spentUsd,
       terminated,
       depth,
       toolCalls,

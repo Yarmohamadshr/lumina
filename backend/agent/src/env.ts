@@ -21,6 +21,11 @@ export const env = {
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
   /** Deep search's plan is its first paint (SLA: 4 s), so it runs on a faster, cheaper model. */
   plannerModel: process.env.LLM_PLANNER_MODEL ?? 'claude-haiku-4-5',
+  /**
+   * Writes QUICK web answers (learner's decision, Day 9): first token ~0.5 s vs ~1.06 s on Sonnet 5
+   * (5 runs each, same prompt), at half the price. Deep answers and the loop stay on LLM_MODEL.
+   */
+  quickAnswerModel: process.env.LLM_QUICK_ANSWER_MODEL ?? 'claude-haiku-4-5',
   /** Effort for the research loop's tool-picking turns (Sonnet 5: low | medium | high | xhigh | max). */
   loopEffort: (process.env.LLM_LOOP_EFFORT ?? 'low') as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
 

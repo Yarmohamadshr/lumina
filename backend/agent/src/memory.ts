@@ -32,22 +32,39 @@ export async function saveMemory(userId: string, text: string, sourceThread?: st
  * their data. Same mistake, same cost, as the RAG one that makes recall@5 = 0.
  */
 export async function recallMemory(userId: string, query: string, limit = RECALL_LIMIT): Promise<MemoryDoc[]> {
-  return (await memories())
-    .aggregate<MemoryDoc>([
-      {
-        $vectorSearch: {
-          index: SEARCH_INDEXES.memoriesVector,
-          path: 'embedding',
-          queryVector: await embed(query),
-          numCandidates: 100,
-          limit,
-          filter: { userId }
-        }
-      },
-      { $project: { embedding: 0 } } // 1536 numbers we do not need back
-    ])
-    .toArray();
+  const col = await memories();
+  const [found, fresh] = await Promise.all([
+    col
+      .aggregate<MemoryDoc>([
+        {
+          $vectorSearch: {
+            index: SEARCH_INDEXES.memoriesVector,
+            path: 'embedding',
+            queryVector: await embed(query),
+            numCandidates: 100,
+            limit,
+            filter: { userId }
+          }
+        },
+        { $project: { embedding: 0 } } // 1536 numbers we do not need back
+      ])
+      .toArray(),
+    // Read-your-write, as with RAG's probe: the vector index lags a new memory by a few seconds. A
+    // preference saved in thread A and asked about in thread B 3 s later was NOT recalled (the answer
+    // came back in Java for a Python user). So the last few minutes are read straight from the
+    // collection, which has no lag, and merged in.
+    col
+      .find({ userId, createdAt: { $gte: new Date(Date.now() - FRESH_MS) } }, { projection: { embedding: 0 } })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray()
+  ]);
+  const seen = new Set(found.map((m) => m._id));
+  return [...found, ...fresh.filter((m) => !seen.has(m._id))].slice(0, limit + 2);
 }
+
+/** How far back a memory counts as "maybe not indexed yet". */
+const FRESH_MS = 10 * 60_000;
 
 /** GET /memory — everything this user has stored, newest first. */
 export async function listMemory(_req: Request, res: Response): Promise<void> {

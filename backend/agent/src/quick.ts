@@ -3,9 +3,11 @@ import type { TraceEvent } from '@lumina/contract';
 import { env } from './env.js';
 import { llm } from './llm.js';
 import { cachedWebSearch } from './cache.js';
-import { fetchPage, PageUnreadableError, type SearchHit } from './search.js';
+import { fetchPage, pageTextOnly, PageUnreadableError, type SearchHit } from './search.js';
+import { pickSnippet } from './answer.js';
+import { canonicalUrl, knownVerdict, verifyQuote } from './verify.js';
 import { recallMemory, saveMemory } from './memory.js';
-import type { FetchedSource, ResearchContext, ResearchResult } from './loop.js';
+import type { FetchedSource, ResearchContext } from './loop.js';
 
 /**
  * QUICK web search as a fixed pipeline (DESIGN change, Day 9): no Claude call stands between the
@@ -102,76 +104,132 @@ function words(text: string): Set<string> {
   return new Set((text.toLowerCase().match(/[a-z0-9+#.]{3,}/g) ?? []).filter((w) => !STOP.has(w)));
 }
 
-export async function quickSearch(query: string, ctx: ResearchContext, emit: (ev: TraceEvent) => void): Promise<ResearchResult & { memories: string[] }> {
-  let step = 0;
-  let toolCalls = 0;
-  let searches = 0;
-  let cachedSearches = 0;
-  const trace = (tool: TraceEvent['tool'], input: Record<string, unknown>, ok: boolean, ms: number, reason: string, error?: string) => {
-    toolCalls++;
-    emit({ step: ++step, tool, input, ok, ms, reason, ...(error ? { error } : {}) });
-  };
-  const timed = async <T>(fn: () => Promise<T>): Promise<[T, number]> => {
-    const t0 = Date.now();
-    const out = await fn();
-    return [out, Date.now() - t0];
-  };
+export type QuickStart = {
+  memories: string[];
+  /** Pages from searching the question as asked. The speculative answer starts from these. */
+  pages: FetchedSource[];
+  searchCached: boolean;
+  /**
+   * Settles when the live citation check of `pages` is done: null = keep them; otherwise the
+   * replacement pages (a chosen page loaded WITHOUT the quoted text: stale, moved, JS-rendered).
+   */
+  check: Promise<FetchedSource[] | null>;
+  /**
+   * Settles when Haiku's triage is done (and any memory it found is saved and traced). `rewrite` set
+   * → the question depends on the conversation or on a memory: the speculative answer is cancelled
+   * and quickFinish() searches again. Rejects on a provider error: the run fails loud.
+   */
+  decision: Promise<{ rewrite?: string; tokens: { in: number; out: number } }>;
+};
 
-  // ---- 1. at once: the search, memory recall, and Haiku. Haiku starts WITHOUT the memories so it
-  // is not waiting ~0.25 s on the recall; only a user who HAS memories gets a second, informed call
-  // (a stated preference can change what to search). Provider errors are not caught: fail loud.
+type Trace = (tool: TraceEvent['tool'], input: Record<string, unknown>, ok: boolean, ms: number, reason: string, error?: string) => void;
+
+const makeTrace = (emit: (ev: TraceEvent) => void, start = 0): { trace: Trace; next: () => number } => {
+  let step = start;
+  return {
+    trace: (tool, input, ok, ms, reason, error) => emit({ step: ++step, tool, input, ok, ms, reason, ...(error ? { error } : {}) }),
+    next: () => step
+  };
+};
+
+const timed = async <T>(fn: () => Promise<T>): Promise<[T, number]> => {
+  const t0 = Date.now();
+  const out = await fn();
+  return [out, Date.now() - t0];
+};
+
+/** How long the live citation check may take. It runs while Haiku and Claude are starting anyway. */
+const VERIFY_MS = 1000;
+
+type WebPage = Extract<FetchedSource, { kind: 'web' }>;
+const numbered = (pages: WebPage[]): FetchedSource[] => pages.map((p, i) => ({ ...p, n: i + 1 }));
+
+/**
+ * Pages to answer from, straight from the search when Tavily sent their text (else read in
+ * parallel), one per real page (www./m./?query variants are the same page). Every candidate's
+ * snippet is checked against the LIVE page at once, in the background: `check` says whether the
+ * first PAGES_WANTED can stand, or which candidates replace the ones that failed.
+ */
+async function choosePages(hits: SearchHit[], snippetQuery: string, trace: Trace): Promise<{ pages: FetchedSource[]; check: Promise<FetchedSource[] | null> }> {
+  const seen = new Set<string>();
+  const candidates: WebPage[] = [];
+  for (const h of hits) {
+    const key = canonicalUrl(h.url);
+    if (!h.content || seen.has(key)) continue;
+    seen.add(key);
+    const text = pageTextOnly(h.content);
+    // Already known not to show its quote (a repeated question): skip it before speculating on it.
+    if (knownVerdict(h.url, pickSnippet(text, snippetQuery)) === 'missing') continue;
+    candidates.push({ n: 0, kind: 'web', title: h.title || h.url, url: h.url, text });
+  }
+  if (candidates.length < PAGES_WANTED) {
+    const unread = hits.filter((h) => !h.content && !seen.has(canonicalUrl(h.url))).slice(0, PAGES_TRIED);
+    const read = await readTopPages(unread, trace, PAGES_WANTED - candidates.length);
+    candidates.push(...read.filter((p): p is WebPage => p.kind === 'web'));
+  }
+
+  const verdicts = candidates.map((c) => verifyQuote(c.url, pickSnippet(c.text, snippetQuery), VERIFY_MS));
+  const pages = numbered(candidates.slice(0, PAGES_WANTED));
+  const check = (async () => {
+    const chosen = await Promise.all(verdicts.slice(0, PAGES_WANTED));
+    if (!chosen.includes('missing')) return null;
+    // Keep what passed (or could not be checked), fill up from the next candidates that pass.
+    const all = await Promise.all(verdicts);
+    const keep = candidates.filter((_, i) => all[i] !== 'missing').slice(0, PAGES_WANTED);
+    for (const [i, c] of candidates.entries()) {
+      if (all[i] === 'missing') trace('fetch_page', { url: c.url }, false, VERIFY_MS, `Checking that "${c.title}" still shows the quoted text.`, 'the live page does not contain the quoted text (stale, moved, or rendered by JavaScript); not cited');
+    }
+    return numbered(keep);
+  })();
+  return { pages, check };
+}
+
+/** Stage 1: search + recall at once, Haiku alongside. Returns as soon as the pages are in. */
+export async function quickStart(query: string, ctx: ResearchContext, emit: (ev: TraceEvent) => void): Promise<QuickStart & { steps: () => number }> {
+  const { trace, next } = makeTrace(emit);
+
+  // Haiku starts WITHOUT the memories so it is not waiting on the recall; only a user who HAS
+  // memories gets a second, informed call (a stated preference can change what to search).
   const recalled = timed(() => recallMemory(ctx.userId, query));
   const blind = triage(query, ctx.history, []);
   // When the informed call replaces it, nobody awaits `blind`: without this, an error in it would be
   // an unhandled rejection, which crashes the process. When it IS used, the await still rethrows.
   blind.catch(() => undefined);
-  const [[memories, memMs], [first, searchMs], plan] = await Promise.all([
-    recalled,
-    timed(() => cachedWebSearch(query)),
-    recalled.then(([m]) => (m.length ? triage(query, ctx.history, m.map((x) => x.text)) : blind))
-  ]);
+  const plan = recalled.then(([m]) => (m.length ? triage(query, ctx.history, m.map((x) => x.text)) : blind));
+  plan.catch(() => undefined); // awaited through `decision`; see above
+
+  const [[memories, memMs], [first, searchMs]] = await Promise.all([recalled, timed(() => cachedWebSearch(query))]);
   trace('recall_memory', { query }, true, memMs, 'Checking what I know about this user, in case it changes the answer.');
-  searches++;
-  if (first.cached) cachedSearches++;
-  trace('web_search', { query }, true, searchMs, 'Searching the web for the question as asked; the results include each page\'s text.');
+  trace('web_search', { query }, true, searchMs, "Searching the web for the question as asked; the results include each page's text.");
+  const { pages, check } = await choosePages(first.hits, query, trace);
 
-  // A follow-up that only makes sense in context ("and its default port?") gets a second search
-  // with the standalone version. A question that already stands alone costs nothing extra.
-  let hits: SearchHit[] = first.hits;
-  const standalone = plan.query;
-  if (standalone && norm(standalone) !== norm(query)) {
-    const [second, ms] = await timed(() => cachedWebSearch(standalone));
-    searches++;
-    if (second.cached) cachedSearches++;
-    trace('web_search', { query: standalone }, true, ms, 'The question depends on the conversation or on what I know about this user, so searching its standalone form.');
-    hits = second.hits.length ? second.hits : first.hits;
-  }
+  const decision = plan.then(async (p) => {
+    // Belt and braces: Haiku was told not to re-save what it was shown, but a repeat would pile up.
+    if (p.saveMemory && !memories.some((m) => overlap(m.text, p.saveMemory!) >= 0.6)) {
+      const [, ms] = await timed(() => saveMemory(ctx.userId, p.saveMemory!, ctx.threadId));
+      trace('save_memory', { text: p.saveMemory }, true, ms, 'The user stated a lasting preference about themselves, so remembering it.');
+    }
+    const rewrite = p.query && norm(p.query) !== norm(query) ? p.query : undefined;
+    return { ...(rewrite ? { rewrite } : {}), tokens: p.tokens };
+  });
 
-  // Belt and braces: Haiku was told not to re-save what it was shown, but a repeat would pile up.
-  const alreadyKnown = plan.saveMemory && memories.some((m) => overlap(m.text, plan.saveMemory!) >= 0.6);
-  if (plan.saveMemory && !alreadyKnown) {
-    const [, ms] = await timed(() => saveMemory(ctx.userId, plan.saveMemory!, ctx.threadId));
-    trace('save_memory', { text: plan.saveMemory }, true, ms, 'The user stated a lasting preference about themselves, so remembering it.');
-  }
+  return { memories: memories.map((m) => m.text), pages, check, searchCached: first.cached, decision, steps: next };
+}
 
-  // ---- 2. the pages: straight from the search when Tavily returned their text (the usual case),
-  // otherwise read in parallel, going as soon as PAGES_WANTED are in.
-  const withText = hits.filter((h) => h.content).slice(0, PAGES_WANTED);
-  const pages: FetchedSource[] = withText.map((h, i) => ({ n: i + 1, kind: 'web', title: h.title || h.url, url: h.url, text: h.content! }));
-  if (pages.length < PAGES_WANTED) {
-    const more = await readTopPages(hits.filter((h) => !h.content).slice(0, PAGES_TRIED), trace, PAGES_WANTED - pages.length);
-    for (const p of more) pages.push({ ...p, n: pages.length + 1 });
-  }
-
-  return {
-    messages: [],
-    pages,
-    terminated: 'done',
-    tokens: { in: plan.tokens.in, out: plan.tokens.out, cacheWrite: 0, cacheRead: 0 },
-    toolCalls,
-    searchCached: searches > 0 && cachedSearches === searches,
-    memories: memories.map((m) => m.text)
-  };
+/** Stage 2, only when the triage asked for it: search the standalone form of the question. */
+export async function quickFinish(
+  rewrite: string,
+  /** The text snippets are picked for; ask.ts builds the sources with the same string. */
+  snippetQuery: string,
+  emit: (ev: TraceEvent) => void,
+  stepsSoFar: number
+): Promise<{ pages: FetchedSource[]; searchCached: boolean }> {
+  const { trace } = makeTrace(emit, stepsSoFar);
+  const [second, ms] = await timed(() => cachedWebSearch(rewrite));
+  trace('web_search', { query: rewrite }, true, ms, 'The question depends on the conversation or on what I know about this user, so searching its standalone form.');
+  // No speculation on this path, so the live check is simply awaited (≤ VERIFY_MS).
+  const { pages, check } = await choosePages(second.hits, snippetQuery, trace);
+  return { pages: (await check) ?? pages, searchCached: second.cached };
 }
 
 /** Stop waiting for more pages this long after the fetches start, if at least one page is in. */
@@ -185,8 +243,6 @@ function overlap(a: string, b: string): number {
   const both = [...wa].filter((w) => wb.has(w)).length;
   return both / (new Set([...wa, ...wb]).size || 1);
 }
-
-type Trace = (tool: TraceEvent['tool'], input: Record<string, unknown>, ok: boolean, ms: number, reason: string, error?: string) => void;
 
 /**
  * Fetch every candidate at once; resolve with the first PAGES_WANTED readable pages, in the order
