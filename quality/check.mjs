@@ -157,6 +157,31 @@ const CHECKS = {
       .map((r) => r.id);
     return todo.length ? fail(`${todo.length} rule(s) still lack a real precedent: ${todo.join(', ')}`) : pass('all rules cite a precedent');
   },
+
+  // Added by LUMINA (2026-09-20) with rule D1. See rules.json for the precedent.
+  D1: (ctx, rule) => {
+    const declared = (rule.params && rule.params.deployConfigs) || [];
+    const configs = declared.filter((p) => existsSync(join(ctx.root, p)));
+    if (!configs.length) return skip('no deploy configs declared or found');
+    const readiness = (((rule.params || {}).readinessPaths) || []).map((s) => s.toLowerCase());
+    const bad = [];
+    for (const rel of configs) {
+      const lines = readFileSync(join(ctx.root, rel), 'utf8')
+        .split('\n')
+        .map((l) => l.replace(/#.*$/, '').trim());
+      let inCheck = false;
+      for (const line of lines) {
+        if (/^\[\[?[^\]]*check[^\]]*\]\]?$/i.test(line)) { inCheck = true; continue; }
+        if (line.startsWith('[')) { inCheck = false; continue; }
+        if (!inCheck) continue;
+        const m = line.match(/^path\s*=\s*["']([^"']+)["']/i);
+        if (m && readiness.includes(m[1].toLowerCase())) {
+          bad.push(`${rel}: platform check targets readiness path "${m[1]}"`);
+        }
+      }
+    }
+    return bad.length ? fail(bad.join('; ')) : pass(`${configs.length} deploy config(s) clean`);
+  },
 };
 
 // ---------------------------------------------------------------- main

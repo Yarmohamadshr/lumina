@@ -9,7 +9,7 @@
       "severity": "error",
       "rule": "Every budget is a positive number, every ratio threshold is within 0 to 1, and every declared file path exists.",
       "precedent": [
-        "TODO \u2014 record the first time a stale or impossible threshold wasted a run."
+        "LUMINA, 2026-09-18, the day we built deep search: we set DEEP_SUB_QUESTIONS_MAX to 6 while the whole run had a budget of only 24 tool calls. Both numbers looked reasonable on their own, and nothing in the code ever compared them to each other. The first real run planned six sub-questions, spent all 24 calls on the first four, and left sub-questions 5 and 6 with no research at all; it still cost $0.176 and took 46 seconds. We fixed it by lowering the limit to 4 and giving each branch its own ceiling of max(3, maxCalls/(n*1.5)), so four branches use 16 of the 24 calls. The rule is the fix: thresholds have to be checked against each other before a run starts, because a number that is fine on its own can be impossible next to the budget it has to live inside."
       ],
       "selfCheck": "Could this expectations file pass under any possible run? If a threshold is above 1.0 or a path is missing, no.",
       "params": {}
@@ -33,7 +33,7 @@
       "severity": "error",
       "rule": "Every run ends with terminated='done'. A run ending at an iteration or token cap is a failure even when the final answer is right.",
       "precedent": [
-        "TODO \u2014 record the first run that hit a cap and still looked successful."
+        "LUMINA, 2026-09-18: our first real deep search returned 9 distinct sources, 4.5 times what the same question found on quick, with all 24 trace steps tagged with their sub-question and a complete, well-cited answer. It looked like the best result we had produced up to that point, and we nearly kept it as our good example. The only sign that anything was wrong was the word \"cap\" in the run log: the run had run out of calls, and two of the six sub-questions had researched nothing, so the answer was written without them. The rule is the fix: whether the answer looks right and whether the run actually finished are two different questions, and only terminated answers the second one."
       ],
       "selfCheck": "Why did this loop stop? If the answer is 'it ran out', the agent did not work.",
       "params": {}
@@ -45,7 +45,7 @@
       "severity": "warn",
       "rule": "No tool is called more than maxConsecutiveSameTool times in a row without an intervening different call.",
       "precedent": [
-        "TODO \u2014 record the first retry loop that burned budget without progress."
+        "LUMINA, 2026-09-19, while building the worker that indexes uploads: one PDF crashed the worker process instead of throwing an error we could catch. Because the process died, the code never reached the catch block that marks a job failed, so the job stayed as running with an old heartbeat. Our sweeper then did exactly what we designed it to do and moved the stale job back to pending, the next worker claimed it, and it crashed again. Every single step was correct and nothing in the logs looked like an error; it just looked busy, and it would have run forever. The rule is the fix: we now fail a job after 3 attempts, because the same tool repeating is only healthy if something changes between the attempts."
       ],
       "selfCheck": "Scan the call sequence. Is the same tool repeating because it is making progress, or because it is stuck?",
       "params": {
@@ -59,7 +59,7 @@
       "severity": "error",
       "rule": "Every tool named in trajectory.mustCallTools appears at least once in the run.",
       "precedent": [
-        "TODO \u2014 record the first agent that answered from parametric memory instead of retrieving."
+        "LUMINA, 2026-09-18, just after memory started working: we asked \"What is Redis?\" and then \"What port does it use?\" in the same thread, and the second question came back with \"No sources were provided, so I cannot answer.\" The trace showed only recall_memory. With the earlier turns of the thread in front of it, Claude decided it already knew the answer and never searched at all. We did have a gate for this, but it only fired when the model had searched and not fetched (!pages.length && titles.size), so a run that skipped searching entirely went straight past it. The rule is the fix: we check that retrieval actually happened instead of trusting the model to do it, and the gate now fires whenever nothing was fetched."
       ],
       "selfCheck": "Did retrieval actually happen, or did the model already know the answer and skip it?",
       "params": {}
@@ -71,7 +71,7 @@
       "severity": "error",
       "rule": "No tool named in trajectory.mustNotCallTools appears in the run.",
       "precedent": [
-        "TODO \u2014 record the first offline eval that quietly reached the internet."
+        "TODO — record the first offline eval that quietly reached the internet. No such incident in LUMINA: toolsFor(depth) filters the tool list by depth and mode, so an offline or docs-only run has no web tool to reach for. Left open deliberately rather than invented."
       ],
       "selfCheck": "Could this run have reached anything outside the declared corpus?",
       "params": {}
@@ -83,7 +83,7 @@
       "severity": "error",
       "rule": "The declared goldSetPath exists and holds at least minGoldItems examples.",
       "precedent": [
-        "TODO \u2014 record the first eval that passed against four hand-picked questions."
+        "TODO — record the first eval that passed against four hand-picked questions. No such incident in LUMINA: the gold set has 39 questions over a 4-document corpus. Left open deliberately rather than invented."
       ],
       "selfCheck": "How many items is this score computed over? Under 30, it is an anecdote.",
       "params": {
@@ -97,7 +97,7 @@
       "severity": "error",
       "rule": "Every threshold declared under eval is met or exceeded by the matching metric in the eval report.",
       "precedent": [
-        "TODO \u2014 record the first time a threshold was lowered to make a build pass."
+        "TODO — record the first time a threshold was lowered to make a build pass. No such incident in LUMINA: no SLA in benchmark/sla.json was loosened at any point; the numbers were declared before the first bench run and the code was changed to meet them. Left open deliberately rather than invented."
       ],
       "selfCheck": "Was this threshold set before or after seeing the score?",
       "params": {}
@@ -121,7 +121,7 @@
       "severity": "error",
       "rule": "Total tokens for a run do not exceed budget.maxTokensPerRun.",
       "precedent": [
-        "TODO \u2014 record the first context-growth bug found in a bill rather than a test."
+        "LUMINA, 2026-09-18: one answer to \"What is Redis?\" cost $0.0588 and used 19,811 input tokens. Nothing was leaking and no test failed; the cost came from the shape of the loop itself. The thread history carried whole previous answers, and an agent loop resends its entire conversation on every turn, so anything we put in the context is paid for once per remaining step, not once. We only found it by reading the cost in the footer of the UI. The rule is the fix: we cap history at 400 characters per turn and cache the repeated prefix, which brought the same question down to $0.0348 locally and $0.0201 in production."
       ],
       "selfCheck": "Does token use grow with conversation length in a way nobody declared?",
       "params": {}
@@ -133,7 +133,7 @@
       "severity": "warn",
       "rule": "Wall-clock seconds for a run do not exceed budget.maxWallClockSec.",
       "precedent": [
-        "TODO \u2014 record the first demo that was correct and unusably slow."
+        "LUMINA, 2026-09-19, the full benchmark against production: 13 of the 16 SLAs passed. Grounding was 0.976, recall@5 was 1.00, there were no errors and no dangling citations, so every number about whether the answers were correct was green. But TTFT p95 was 24,371 ms against a limit of 2,500 ms, and about 12 seconds of a 13.6 second wait was just our loop making four Claude calls one after another. A user watching a blank screen for 24 seconds assumes the app is broken, however good the answer is when it finally arrives, and no correctness metric would ever have told us that. The rule is the fix: we changed quick search from the agent loop to a pipeline that answers on Haiku, and TTFT p95 came down to 1,430 ms."
       ],
       "selfCheck": "Would a user wait this long without assuming it broke?",
       "params": {}
@@ -145,7 +145,7 @@
       "severity": "warn",
       "rule": "Cost in USD for a run does not exceed budget.maxCostUsd.",
       "precedent": [
-        "TODO \u2014 record the first per-run cost that made the product uneconomic at scale."
+        "LUMINA, 2026-09-18: the question \"latest features in Python today\" cost $0.0619, over our $0.05 limit. The answer was correct and properly cited, no test failed, and we only noticed because we happened to be reading the cost in the footer while retesting something else. The cause was that every fetched page was sent to Claude at 8,000 characters, resent on every turn of the loop, and sent once more in the answer call. Our sla.json plans for 100,000 answers a month, so that one number is $6,190 a month against a $5,000 budget, which means losing money on every correct answer. The rule is the fix: we cut pages to 4,000 characters, max_tokens from 2,000 to 1,200 and capped the answer at 200 words, which brought it to $0.0443."
       ],
       "selfCheck": "Multiply this by expected daily volume. Is the business still viable?",
       "params": {}
@@ -169,10 +169,33 @@
       "severity": "warn",
       "rule": "No rule in this file carries a precedent beginning with TODO. A rule without a real incident is a preference, not case law.",
       "precedent": [
-        "Ported precedent, hyperframes-student-kit addons/README.md: 'When a review catches something new, add the precedent \u2014 an empty lessons file is the failure mode this exists to prevent.'"
+        "Ported precedent, hyperframes-student-kit addons/README.md: 'When a review catches something new, add the precedent — an empty lessons file is the failure mode this exists to prevent.'"
       ],
       "selfCheck": "Can you name the incident, the date, and what it cost? If not, delete the rule or go find the story.",
       "params": {}
+    },
+    {
+      "id": "D1",
+      "title": "Readiness is never wired to a platform health check",
+      "type": "deploy",
+      "severity": "error",
+      "rule": "No deploy config declares a platform health check against an endpoint that reports dependency readiness; the platform may check liveness only.",
+      "precedent": [
+        "LUMINA, 2026-09-18, about two hours after our first deploy: the site went dark. The Vercel UI showed \"gateway unreachable\" and curl on the gateway's /health returned nothing at all after 30 seconds. The agent machine had stopped, and our gateway did the honest thing and answered 503 from /health, because the contract says /health reports whether its dependencies are up. But Fly's [[http_service.checks]] block pointed at that same /health, and Fly read the 503 as \"this machine is broken\", so it stopped routing to the gateway completely: \"[PR01] no known healthy instances found for route tcp/443\". One dependency being down took the whole site offline for about two hours, and it was the honest answer that did it, because a gateway that lied and returned 200 would have stayed in the load balancer. Health for the platform (is this process alive?) and health for the contract (are my dependencies up?) are two different questions, and wiring one to the other turns a degraded service into a dead one. The rule is the fix: we removed the HTTP check from backend/gateway/fly.toml, so Fly keeps routing while the process lives and callers get the truthful 503 from /health."
+      ],
+      "selfCheck": "If one dependency goes down, does this config degrade the service or delete it from the load balancer?",
+      "params": {
+        "deployConfigs": [
+          "backend/gateway/fly.toml",
+          "backend/agent/fly.toml"
+        ],
+        "readinessPaths": [
+          "/health",
+          "/healthz",
+          "/ready",
+          "/readiness"
+        ]
+      }
     }
   ]
 }
