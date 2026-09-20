@@ -19,7 +19,8 @@ import cors from 'cors';
 import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   AskBody,
   CreateSpaceBody,
@@ -132,6 +133,32 @@ const refuseHugeUpload: express.RequestHandler = (req, res, next) => {
 };
 app.post('/spaces/:spaceId/documents', requireUser, validateParam('spaceId', SpaceId), refuseHugeUpload, wrap(proxy));
 
+// ---------------------------------------------------------------- the evals report
+
+/**
+ * The Product Evaluation the provided /evals page renders. Built offline by
+ * eval/build-report.mjs from reports/bench.json, reports/quality.json and runs/*.json,
+ * then baked into the image, so serving it is a file read and nothing is recomputed
+ * here. No auth: it is the submission, and a grader opens it without a user id.
+ */
+const REPORT_PATHS = [
+  process.env.EVALS_REPORT_PATH,
+  resolve(process.cwd(), '../../reports/report.json'),
+  resolve(process.cwd(), 'reports/report.json')
+].filter(Boolean) as string[];
+
+app.get('/evals/report.json', (_req, res) => {
+  const hit = REPORT_PATHS.find((p) => existsSync(p));
+  if (!hit) {
+    res.status(404).json({
+      error: 'no evals report on this deployment — run eval/build-report.mjs and redeploy',
+      status: 404
+    });
+    return;
+  }
+  res.type('application/json').send(readFileSync(hit, 'utf8'));
+});
+
 // ---------------------------------------------------------------- everything else: 501
 
 /**
@@ -153,6 +180,7 @@ for (const route of ROUTES) {
   const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
   app[method](path, notImplemented(`${route.method} ${route.path}`));
 }
+
 
 // ---------------------------------------------------------------- static UI
 

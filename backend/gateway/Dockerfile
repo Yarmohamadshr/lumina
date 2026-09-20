@@ -25,6 +25,9 @@ COPY --from=build /app/packages/contract/dist packages/contract/dist
 COPY --from=build /app/backend/gateway/package.json backend/gateway/package.json
 COPY --from=build /app/backend/gateway/dist backend/gateway/dist
 
+# The Product Evaluation the /evals page renders, built offline by eval/build-report.mjs.
+COPY reports/report.json reports/report.json
+
 WORKDIR /app/backend/gateway
 EXPOSE 8787
 CMD ["node", "dist/index.js"]
