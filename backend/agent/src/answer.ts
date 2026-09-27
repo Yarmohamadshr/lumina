@@ -10,7 +10,7 @@ const MAX_SNIPPET_CHARS = 400;
 const PAGE_CHARS_FOR_MODEL = 3000; // see the note in loop.ts: this number multiplies into the bill
 
 /**
- * Tavily returns markdown, but the grader downloads the real HTML and strips the tags, so it
+ * Tavily returns markdown, but the independent grounding check downloads the real HTML and strips the tags, so it
  * sees only the words a browser shows. Drop images, keep a link's text but not its url, and
  * turn markdown symbols into spaces. The words and their order stay exactly as on the page.
  */
@@ -25,7 +25,7 @@ function visibleText(line: string): string {
 
 /**
  * The longest run of the passage whose words carry no apostrophe or curly quote, if it is long
- * enough to quote. Pages often write "you&rsquo;ll" in HTML; the grader turns the entity into a
+ * enough to quote. Pages often write "you&rsquo;ll" in HTML; the grounding check turns the entity into a
  * space ("you ll") while our copy says "you'll", so any 12-word window touching it cannot match.
  * Still a verbatim substring: a contiguous run of the same single-spaced words.
  */
@@ -84,7 +84,7 @@ export function buildSources(pages: (FetchedSource & { subQuestion?: number })[]
 
 /**
  * Code in an answer (`data[0]`, `rows[1]`) looks exactly like a citation to anything that reads
- * `[n]` — our own dangling-citation check and the grader's regex alike. A prompt rule did not hold
+ * `[n]` — our own dangling-citation check and the grounding checker's regex alike. A prompt rule did not hold
  * (the model still wrote data[0]), so it is enforced here, on the stream: a bracketed number that
  * is CODE — inside a ``` block, or right after a name or `)` — becomes `[ 0 ]`, which is still valid
  * Python and JS. A `[7]` in prose is left exactly as written: if it cites nothing, that is a real
@@ -171,7 +171,7 @@ export async function streamAnswer(
     : '(no sources were found)';
 
   // A deep answer is structured by the plan it ran, and says plainly where the evidence is thin.
-  // Padding is what the human grader is looking for, so length is not the goal: coverage is.
+  // Padding is what a human reviewer notices first, so length is not the goal: coverage is.
   const deep = plan?.length
     ? `\nThis was a DEEP search. It researched these sub-questions:\n` +
       plan.map((q) => `${q.i}. ${q.question}`).join('\n') +

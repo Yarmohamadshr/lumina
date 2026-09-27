@@ -10,7 +10,7 @@ const TAVILY = 'https://api.tavily.com';
 
 /**
  * Sites whose HTML does not contain the words they show: rendered by JavaScript or behind a login.
- * Tavily can read them; the grader, fetching the raw HTML, sees an empty page — so a correct
+ * Tavily can read them; the grounding check, fetching the raw HTML, sees an empty page — so a correct
  * citation to one scores as UNgrounded (an instagram.com source failed 3 citations in one run).
  */
 const UNVERIFIABLE_SITES = [

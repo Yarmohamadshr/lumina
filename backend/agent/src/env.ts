@@ -1,7 +1,7 @@
 import { config } from 'dotenv';
 import { resolve } from 'node:path';
 
-// The single .env at the assignment root. Provider keys are read HERE and nowhere else.
+// The single .env at the repo root. Provider keys are read HERE and nowhere else.
 config({ path: resolve(process.cwd(), '../../.env') });
 config({ path: resolve(process.cwd(), '.env') });
 

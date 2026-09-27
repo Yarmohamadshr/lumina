@@ -2,9 +2,9 @@
  * Citation check against the LIVE page: is the snippet we are about to show really on the page the
  * user will open? A search index can be stale — xcitium.com answered 200 "Page Not Found" for an
  * article Tavily still had — and a JavaScript-rendered page has none of its words in the HTML. Both
- * look fine to us and wrong to a reader (and to the grader, which fetches the raw HTML).
+ * look fine to us and wrong to a reader (and to the grounding check, which fetches the raw HTML).
  *
- * The rule mirrors the grader's: lower-case, keep letters/digits/apostrophes, and look for 12
+ * The rule mirrors the grounding check's: lower-case, keep letters/digits/apostrophes, and look for 12
  * consecutive words of the snippet in the page's text with the tags stripped.
  */
 export type Verdict = 'ok' | 'missing' | 'unknown';

@@ -139,7 +139,7 @@ app.post('/spaces/:spaceId/documents', requireUser, validateParam('spaceId', Spa
  * The Product Evaluation the provided /evals page renders. Built offline by
  * eval/build-report.mjs from reports/bench.json, reports/quality.json and runs/*.json,
  * then baked into the image, so serving it is a file read and nothing is recomputed
- * here. No auth: it is the submission, and a grader opens it without a user id.
+ * here. No auth: it is a public report page, opened without a user id.
  */
 const REPORT_PATHS = [
   process.env.EVALS_REPORT_PATH,
